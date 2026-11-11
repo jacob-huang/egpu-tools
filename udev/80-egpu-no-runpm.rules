@@ -1,0 +1,10 @@
+# Installed by egpu-tools (https://github.com/jacob-huang/egpu-tools)
+#
+# Disable runtime power management for eGPUs: any display-class PCI device
+# (class 0x03xxxx) that the kernel marks "removable", i.e. it sits behind a
+# Thunderbolt/USB4 port. Resuming an autosuspended GPU over USB4 can fail
+# ("ring gfx test failed (-110)", runtime_status=error) and leave the card dead
+# until a PCI remove + rescan. Cost: the eGPU never idles down to D3.
+#
+# Internal GPUs are not removable, so they keep runtime PM.
+ACTION=="add|bind", SUBSYSTEM=="pci", ATTR{class}=="0x03*", ATTR{removable}=="removable", ATTR{power/control}="on"

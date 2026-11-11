@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+# egpu-on: bring a Thunderbolt/USB4 eGPU online and verify it.
+#
+# Handles every starting state (see the runbook, §3, §5, T2, T3, T5):
+#   - already attached and healthy      -> report status, change nothing
+#   - attached but broken (runtime PM   -> PCI remove + rescan to re-initialize
+#     hang, no driver bound)               (asks first unless -y)
+#   - detached by egpu-off, cable still -> PCI rescan
+#     plugged in and enclosure powered
+#   - enclosure not connected yet       -> waits for you to power it on and
+#                                          plug in the cable, authorizes it if
+#                                          needed, then rescans
+# Finally it makes sure runtime PM is off and checks that Vulkan sees the GPU.
+#
+# The eGPU is the first display device behind a Thunderbolt/USB4 port; the
+# enclosure is the first Thunderbolt/USB4 device. Set EGPU_PCI_ID and
+# EGPU_TB_NAME in /etc/egpu-tools.conf if you have more than one.
+#
+# GNOME session check (see the runbook, "Known risk"): GNOME/mutter takes over
+# every GPU that appears unless the card carries the udev tag
+# mutter-device-ignore (81-egpu-mutter-ignore.rules). A card GNOME manages
+# can't be detached later without logging out, and removing it while GNOME
+# holds it can crash the session. So while a graphical session is active:
+#   - attaching (rescan) is refused if the ignore rule is not installed
+#   - re-initializing a broken GPU is refused if gnome-shell holds its card
+# unless --allow-graphical-session. Without a session (text console or SSH
+# while logged out) nothing is refused. At the end it reports whether GNOME
+# manages the eGPU, i.e. whether egpu-off can detach it without logging out,
+# and a tip: Electron / GTK 4 apps started after this open the eGPU and block
+# egpu-off until quit, so start them before egpu-on when you can.
+#
+# Usage: egpu-on [-w|--wait SECS] [-y|--yes] [--allow-graphical-session]
+#                [-V|--version] [-h|--help]
+#   -w, --wait SECS  how long to wait for the enclosure to appear (default 120)
+#   -y, --yes        don't ask before re-initializing a broken GPU
+#   --allow-graphical-session
+#                    attach / re-initialize even though GNOME will manage (or
+#                    already holds) the eGPU; you must log out before egpu-off
+#   -V, --version    print the version and exit
+#   -h, --help       show this help and exit
+#
+# Exit codes: 0 eGPU online and healthy, 1 usage/env error,
+#             2 enclosure not detected, 3 GPU did not come up / unhealthy,
+#             4 aborted by user,
+#             5 blocked (graphical session active and GNOME would manage
+#               or already holds the eGPU)
+
+set -euo pipefail
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+LIB=${SELF%/*}/../lib/egpu-tools/common.sh
+[[ -r "$LIB" ]] || { echo "egpu-on: can't find $LIB; re-run install.sh" >&2; exit 1; }
+# shellcheck source=../lib/egpu-tools/common.sh
+. "$LIB"
+
+RUNPM_RULE=/etc/udev/rules.d/80-egpu-no-runpm.rules
+IGNORE_RULE=/etc/udev/rules.d/81-egpu-mutter-ignore.rules
+
+YES=0 ALLOW_GUI=0 WAIT_ARG=""
+ORIG_ARGS=("$@")
+while (( $# )); do
+  case "$1" in
+    -w|--wait) [[ "${2:-}" =~ ^[0-9]+$ ]] || { echo "--wait needs a number of seconds" >&2; exit 1; }
+               WAIT_ARG=$2; shift ;;
+    -y|--yes)  YES=1 ;;
+    --allow-graphical-session) ALLOW_GUI=1 ;;
+    -V|--version) echo "egpu-on $EGPU_TOOLS_VERSION"; exit 0 ;;
+    -h|--help) egpu_usage "$SELF"; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; egpu_usage "$SELF" >&2; exit 1 ;;
+  esac
+  shift
+done
+
+# Root is needed for PCI rescan/remove, boltctl authorize and sysfs power control.
+egpu_need_root "$SELF" "${ORIG_ARGS[@]}"
+egpu_load_config
+WAIT_TB=${WAIT_ARG:-$EGPU_WAIT_TB}
+START_TS=$(date '+%Y-%m-%d %H:%M:%S')
+
+pci_remove_gpu() {
+  local g=$1 slot=${1%.*} f
+  for f in "$SYS_PCI/$slot".*; do
+    [[ "$(basename "$f")" == "$g" ]] && continue
+    echo 1 > "$f/remove" 2>/dev/null || true
+  done
+  timeout "$EGPU_REMOVE_TIMEOUT" sh -c "echo 1 > $SYS_PCI/$g/remove" \
+    || { err "Removing $g timed out (stuck in the driver); see the runbook, T6."; exit 3; }
+  sleep 2
+}
+
+rescan_and_wait() {
+  info "Rescanning the PCI bus ..."
+  echo 1 > /sys/bus/pci/rescan
+  local i g
+  for ((i = 0; i < EGPU_WAIT_GPU; i++)); do
+    g=$(egpu_gpu_addr)
+    if [[ -n "$g" && -n "$(egpu_driver "$g")" && -e /dev/dri/by-path/pci-$g-render ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# --- GNOME session gate ------------------------------------------------------------
+egpu_gui_sessions
+gui_blocked() {      # print why, then exit 5 unless --allow-graphical-session
+  warn "Active graphical login session: ${GUI_ACTIVE[*]}"
+  local line; for line in "$@"; do warn "$line"; done
+  if (( ALLOW_GUI )); then
+    warn "--allow-graphical-session given: continuing anyway."
+    return 0
+  fi
+  err "Blocked. Either install $IGNORE_RULE (install.sh does this),"
+  err "or save your work, log out, and run egpu-on from a text console (Ctrl+Alt+F3) or SSH,"
+  err "or re-run with --allow-graphical-session."
+  exit 5
+}
+# Attaching: GNOME will take the new card unless the ignore rule is installed.
+attach_gate() {
+  (( ${#GUI_ACTIVE[@]} )) || return 0
+  if [[ -f "$IGNORE_RULE" ]]; then
+    info "GNOME session active; $IGNORE_RULE is installed, so GNOME should ignore the eGPU."
+  else
+    gui_blocked "$IGNORE_RULE is not installed: GNOME will take over the eGPU when it appears," \
+                "and you'd have to log out before detaching it again (crash risk, mutter#4705)."
+  fi
+}
+
+# --- 1. Already on the PCI bus? -----------------------------------------------
+GPU=$(egpu_gpu_addr)
+if [[ -n "$GPU" ]]; then
+  if egpu_healthy "$GPU"; then
+    ok "eGPU already attached at $GPU and healthy ($(egpu_driver "$GPU"), runtime PM: $(egpu_rpm "$GPU"))"
+  else
+    warn "eGPU is on the PCI bus at $GPU but NOT healthy" \
+         "(driver: $(egpu_driver "$GPU"), runtime PM: $(egpu_rpm "$GPU"))."
+    warn "Likely the runtime-PM resume hang (runbook T5). Fix: PCI remove + rescan."
+    warn "Apps that still have the eGPU open (e.g. Xwayland clients) may lose it."
+    # Removing a card GNOME holds is the hot-remove that crashes the session.
+    holders=$(egpu_mutter_pids "$(egpu_card_node "$GPU")")
+    if [[ -n "$holders" ]] && (( ${#GUI_ACTIVE[@]} )); then
+      gui_blocked "gnome-shell (pid $holders) holds the eGPU. Removing it now can crash GNOME" \
+                  "minutes later at the next monitor change, logging you out (mutter#4705)."
+    fi
+    attach_gate
+    if (( ! YES )); then
+      read -r -p "Re-initialize the eGPU now? [y/N] " ans
+      [[ "$ans" =~ ^[Yy]$ ]] || { err "Aborted."; exit 4; }
+    fi
+    echo on > "$SYS_PCI/$GPU/power/control" 2>/dev/null || true
+    info "Removing $GPU ..."
+    pci_remove_gpu "$GPU"
+    rescan_and_wait || { err "eGPU did not come back after rescan. Power-cycle the enclosure (runbook T6)."; exit 3; }
+  fi
+else
+  # --- 2. Not on the bus: is the enclosure connected? -------------------------
+  attach_gate
+  TB=$(egpu_tb_dev)
+  if [[ -z "$TB" ]]; then
+    info "Enclosure not detected. Power it on, wait ~5 s, then plug in the Thunderbolt/USB4 cable."
+    info "Waiting up to ${WAIT_TB}s (Ctrl-C to cancel) ..."
+    for ((i = 0; i < WAIT_TB; i++)); do
+      TB=$(egpu_tb_dev); [[ -n "$TB" ]] && break
+      sleep 1
+    done
+    if [[ -z "$TB" ]]; then
+      err "No ${EGPU_TB_NAME:-Thunderbolt/USB4} enclosure detected after ${WAIT_TB}s."
+      err "Check enclosure power, the cable (USB4/TB4/TB5) and the port (runbook T1)."
+      [[ -n "$EGPU_TB_NAME" ]] && err "Devices seen: $(egpu_tb_list | xargs -d '\n' | sed 's/) /), /g')"
+      exit 2
+    fi
+    sleep 3   # let boltd authorize and the tunnel settle
+  fi
+  ok "Enclosure detected: $(cat "$TB/vendor_name" 2>/dev/null) $(cat "$TB/device_name") ($(basename "$TB"))"
+
+  # --- 3. Authorization ---------------------------------------------------------
+  if [[ "$(cat "$TB/authorized" 2>/dev/null)" != 1 ]]; then
+    uuid=$(cat "$TB/unique_id")
+    command -v boltctl >/dev/null \
+      || { err "Enclosure is not authorized and boltctl is missing (install the 'bolt' package)."; exit 2; }
+    warn "Enclosure is not authorized; authorizing $uuid via boltctl (runbook T2) ..."
+    if boltctl info "$uuid" 2>/dev/null | grep -qE 'stored:[[:space:]]+no'; then
+      boltctl enroll --policy auto "$uuid"     # first time: authorize + remember
+    else
+      boltctl authorize "$uuid"
+    fi
+    sleep 3
+  fi
+  ok "Enclosure authorized"
+
+  # --- 4. Bring the GPU onto the bus ------------------------------------------
+  # After a fresh plug-in the kernel enumerates it by itself; give it a moment
+  # before forcing a rescan (needed after egpu-off without unplugging).
+  for ((i = 0; i < 10; i++)); do GPU=$(egpu_gpu_addr); [[ -n "$GPU" ]] && break; sleep 1; done
+  if [[ -z "$GPU" ]] || [[ -z "$(egpu_driver "$GPU")" ]]; then
+    rescan_and_wait || { err "GPU did not appear / bind within ${EGPU_WAIT_GPU}s. See runbook T3/T4."; exit 3; }
+  else
+    # Wait for the driver to finish creating its device nodes.
+    for ((i = 0; i < EGPU_WAIT_GPU; i++)); do [[ -e /dev/dri/by-path/pci-$GPU-render ]] && break; sleep 1; done
+  fi
+fi
+
+# --- 5. Post-checks -----------------------------------------------------------
+GPU=$(egpu_gpu_addr)
+[[ -n "$GPU" ]] || { err "eGPU not on the PCI bus."; exit 3; }
+DEV=$SYS_PCI/$GPU
+DRIVER=$(egpu_driver "$GPU")
+PCI_ID=$(egpu_pci_id "$GPU")
+
+# Runtime PM must stay off (the resume hang). The udev rule should have done it.
+if [[ "$(cat "$DEV/power/control")" != on ]]; then
+  warn "Runtime PM was enabled; disabling it now."
+  echo on > "$DEV/power/control"
+fi
+[[ -f "$RUNPM_RULE" ]] || warn "Missing $RUNPM_RULE: runtime PM will be re-enabled on next plug-in (runbook T5)."
+
+if ! egpu_healthy "$GPU"; then
+  err "eGPU at $GPU is not healthy (driver: ${DRIVER:-none}, runtime PM: $(egpu_rpm "$GPU")). See runbook §6."
+  exit 3
+fi
+
+# Does GNOME manage the eGPU? Give mutter a moment to react to the hotplug.
+sleep 2
+CARD=$(egpu_card_node "$GPU")
+holders=$(egpu_mutter_pids "$CARD")
+if [[ -n "$holders" ]]; then
+  gnome_state="managed by GNOME (gnome-shell pid $holders) - log out before egpu-off"
+  warn "GNOME manages the eGPU (${CARD##*/}). Log out before running egpu-off (runbook \"Known risk\")."
+elif egpu_has_ignore_tag "$CARD"; then
+  gnome_state="ignored by GNOME (mutter-device-ignore) - egpu-off works while logged in"
+elif pgrep -x gnome-shell >/dev/null; then
+  gnome_state="not tagged mutter-device-ignore - GNOME will manage it at next login"
+  (( ${#GUI_ACTIVE[@]} )) || warn "eGPU is not tagged mutter-device-ignore; GNOME will take it when you log in."
+else
+  gnome_state="not running"
+fi
+
+# Vulkan check, run as the invoking desktop user rather than root.
+vk_rc=0
+vk=$(egpu_vulkan_name "$GPU" "${SUDO_USER:-root}") || vk_rc=$?
+if (( vk_rc == 2 )); then
+  vk="(vulkaninfo not installed; skipped)"
+elif [[ -z "$vk" ]]; then
+  err "The kernel driver is up but Vulkan can't see the eGPU. See runbook T5."
+  exit 3
+fi
+
+TB=$(egpu_tb_dev)
+link="?"
+[[ -n "$TB" ]] && link="$(cat "$TB/rx_speed" 2>/dev/null) x$(cat "$TB/rx_lanes" 2>/dev/null) rx / $(cat "$TB/tx_speed" 2>/dev/null) x$(cat "$TB/tx_lanes" 2>/dev/null) tx"
+vram=""
+[[ -r "$DEV/mem_info_vram_total" ]] && vram="$(( $(cat "$DEV/mem_info_vram_total") / 1024 / 1024 )) MB"
+
+errs=$(journalctl -k --no-pager -q --since "$START_TS" 2>/dev/null \
+        | grep -iE "$GPU|thunderbolt" | grep -iE 'error|fail|hung|timeout' \
+        | grep -vE 'UNLOAD_TA|psp ring|BAR|amdgpu_pci_remove' || true)
+[[ -n "$errs" ]] && { warn "Kernel messages to review:"; echo "$errs" | tail -10 | sed 's/^/       /'; }
+
+echo
+ok "${c_bld}eGPU online.${c_off}"
+echo "     PCI      : $GPU  [$PCI_ID] $(egpu_name "$GPU")"
+echo "     Driver   : $DRIVER"
+echo "     Vulkan   : $vk"
+[[ -n "$vram" ]] && echo "     VRAM     : $vram"
+echo "     Link     : $link"
+echo "     Runtime PM: $(cat "$DEV/power/control") / $(egpu_rpm "$GPU")"
+echo "     GNOME    : $gnome_state"
+echo "     Use it   : $(egpu_offload_hint "$DRIVER" "$PCI_ID")"
+echo
+info "Tip: Electron apps (Orca IDE, VS Code, ...) and GTK 4 apps (Ptyxis, ...) started from"
+echo "     now on open the eGPU even if they don't use it, and block egpu-off until you quit"
+echo "     them. Start such apps before egpu-on when you can. See runbook §4 step 2."

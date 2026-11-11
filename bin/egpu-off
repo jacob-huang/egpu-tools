@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# egpu-off: safely detach a Thunderbolt/USB4 eGPU so the enclosure can be
+# powered off / unplugged while the PC keeps running.
+#
+# Steps (see the runbook, §4 and §5):
+#   1. Locate the eGPU on the PCI bus (first display device behind a
+#      Thunderbolt/USB4 port, or EGPU_PCI_ID from /etc/egpu-tools.conf).
+#   2. Check whether GNOME (mutter) is managing the eGPU's display device.
+#      GNOME/mutter keeps stale state for a hot-removed card it manages and
+#      can abort minutes later at the next monitor change, logging you out
+#      ("meta_kms_update_mode_set: assertion failed", mutter#4705, LP#2149858).
+#      - Card tagged mutter-device-ignore (81-egpu-mutter-ignore.rules) and
+#        not held by gnome-shell: safe to detach while logged in.
+#      - Otherwise, refuse while a graphical (Wayland/X11) session is active on
+#        a seat (unless --allow-graphical-session). Log out first and run this
+#        from a text console (Ctrl+Alt+F3) or SSH. See the runbook, "Known risk".
+#   3. Refuse if a monitor is connected to the eGPU (unless --force).
+#   4. Find processes holding the eGPU's DRM nodes, /dev/kfd or its
+#      /dev/nvidiaN node; refuse if any are not on the allowlist of desktop
+#      processes that survive hot-unplug (unless --force).
+#      If a blocker is a user app holding only the render node (Electron apps
+#      such as Orca IDE or VS Code, GTK 4 apps such as Ptyxis open every GPU at
+#      startup), it prints a tip: quit them and reopen after the detach, start
+#      them before egpu-on next time, and don't use --force on them. It also
+#      warns if egpu-off runs inside a terminal that itself holds the eGPU
+#      (use a text console, Ctrl+Alt+F3, or SSH instead).
+#   5. Remove the GPU's PCI functions (audio first, GPU last), with a timeout.
+#   6. Verify it is gone and report new kernel errors.
+#
+# Usage: egpu-off [-n|--dry-run] [-f|--force] [--allow-graphical-session]
+#                 [-y|--yes] [-V|--version] [-h|--help]
+#   -n, --dry-run  run all checks, change nothing
+#   -f, --force    detach even if a monitor or app is using the eGPU
+#                  (does NOT override the graphical-session check)
+#   --allow-graphical-session
+#                  detach even while a GNOME/X11 session is active and GNOME
+#                  manages the card; the session may crash and log you out
+#                  minutes later (not needed once the ignore rule is in effect)
+#   -y, --yes      don't ask for confirmation before detaching
+#   -V, --version  print the version and exit
+#   -h, --help     show this help and exit
+#
+# Exit codes: 0 detached (or already absent), 1 usage/env error,
+#             2 blocked (GNOME manages the card while a graphical session is
+#               active, monitor on the eGPU, or processes using it),
+#             3 remove failed / timed out,
+#             4 aborted by user
+
+set -euo pipefail
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+LIB=${SELF%/*}/../lib/egpu-tools/common.sh
+[[ -r "$LIB" ]] || { echo "egpu-off: can't find $LIB; re-run install.sh" >&2; exit 1; }
+# shellcheck source=../lib/egpu-tools/common.sh
+. "$LIB"
+
+# Processes (by /proc/PID/comm, max 15 chars) that tolerate GPU hot-unplug.
+# systemd / systemd-logind hold DRM fds for session device management.
+ALLOW_COMM=(systemd systemd-logind gnome-shell gnome-shell-cal Xwayland mutter-x11-fram)
+
+DRY_RUN=0 FORCE=0 YES=0 ALLOW_GUI=0
+for arg in "$@"; do
+  case "$arg" in
+    -n|--dry-run) DRY_RUN=1 ;;
+    -f|--force)   FORCE=1 ;;
+    --allow-graphical-session) ALLOW_GUI=1 ;;
+    -y|--yes)     YES=1 ;;
+    -V|--version) echo "egpu-off $EGPU_TOOLS_VERSION"; exit 0 ;;
+    -h|--help)    egpu_usage "$SELF"; exit 0 ;;
+    *) echo "Unknown option: $arg" >&2; egpu_usage "$SELF" >&2; exit 1 ;;
+  esac
+done
+
+# Root is needed to see every process's open files and to write to sysfs.
+egpu_need_root "$SELF" "$@"
+egpu_load_config
+# shellcheck disable=SC2206  # word splitting of the space-separated list is intended
+ALLOW_COMM+=($EGPU_ALLOW_EXTRA)
+START_TS=$(date '+%Y-%m-%d %H:%M:%S')
+
+# --- 1. Locate the eGPU -------------------------------------------------------
+GPU=$(egpu_gpu_addr)
+if [[ -z "$GPU" ]]; then
+  ok "No eGPU${EGPU_PCI_ID:+ ($EGPU_PCI_ID)} on the PCI bus: already detached. Safe to power off the enclosure."
+  exit 0
+fi
+SLOT=${GPU%.*}
+FUNCS=()
+for f in "$SYS_PCI/$SLOT".*; do [[ -e "$f" ]] && FUNCS+=("$(basename "$f")"); done
+DRIVER=$(egpu_driver "$GPU")
+info "eGPU found at $GPU [$(egpu_pci_id "$GPU")] $(egpu_name "$GPU")"
+info "Functions: ${FUNCS[*]}; driver: ${DRIVER:-none}; runtime PM: $(egpu_rpm "$GPU")"
+
+# --- 2. Active graphical sessions (mutter hot-remove crash) -------------------
+egpu_gui_sessions
+CARD_NODE=$(egpu_card_node "$GPU")
+IGNORE_TAG=0
+egpu_has_ignore_tag "$CARD_NODE" && IGNORE_TAG=1
+MUTTER_PIDS=$(egpu_mutter_pids "$CARD_NODE")
+
+GUI_BLOCKED=0
+if (( IGNORE_TAG )) && [[ -z "$MUTTER_PIDS" ]]; then
+  ok "GNOME is not managing the eGPU (udev tag mutter-device-ignore; gnome-shell doesn't hold ${CARD_NODE##*/})"
+  ok "Safe to detach without logging out"
+elif (( ${#GUI_ACTIVE[@]} )); then
+  warn "Active graphical login session: ${GUI_ACTIVE[*]}"
+  if (( IGNORE_TAG )); then
+    warn "The eGPU has the mutter-device-ignore tag, but gnome-shell (pid $MUTTER_PIDS) still holds"
+    warn "${CARD_NODE##*/}: the tag was added after GNOME had already opened the card. Reconnect the eGPU"
+    warn "while logged out (or log out and back in) so GNOME skips it."
+  else
+    warn "GNOME manages the eGPU's display device (${CARD_NODE##*/}${MUTTER_PIDS:+, gnome-shell pid $MUTTER_PIDS})."
+    warn "To detach without logging out in future, install the 81-egpu-mutter-ignore rule"
+    warn "(install.sh does this) and reconnect the eGPU once while logged out."
+  fi
+  warn "Known risk: GNOME/mutter crashes minutes after an eGPU hot-remove, at the next"
+  warn "monitor change (\"meta_kms_update_mode_set: assertion failed\"), ending the session"
+  warn "and closing every app. Upstream: mutter#4705 / LP#2149858."
+  warn "Save your work, log out, then run egpu-off from a text console (Ctrl+Alt+F3) or SSH."
+  if (( ALLOW_GUI )); then
+    warn "--allow-graphical-session given: continuing anyway."
+  else
+    GUI_BLOCKED=1
+  fi
+elif (( ${#GUI_BACKGROUND[@]} )) && [[ -n "$MUTTER_PIDS" ]]; then
+  warn "Graphical session still running in the background: ${GUI_BACKGROUND[*]}"
+  warn "Its GNOME Shell (pid $MUTTER_PIDS) holds the eGPU and may crash when you switch back to it."
+  warn "Logging out of it fully is the safer option (see the runbook, \"Known risk\")."
+else
+  ok "No graphical login session active"
+fi
+
+# --- 3. Monitors attached to the eGPU -----------------------------------------
+BLOCKED=0
+connected=()
+for conn in /sys/class/drm/card*-*; do
+  [[ -e "$conn/status" ]] || continue
+  dev=$(basename "$(readlink -f "$conn/device")")
+  [[ "$dev" == "$GPU" ]] || continue
+  [[ "$(cat "$conn/status")" == connected ]] && connected+=("$(basename "$conn")")
+done
+if (( ${#connected[@]} )); then
+  warn "Monitor(s) connected to the eGPU: ${connected[*]}"
+  warn "Move windows to the host monitor and disable/unplug these first (Settings → Displays)."
+  BLOCKED=1
+else
+  ok "No monitors connected to the eGPU"
+fi
+
+# --- 4. Processes using the eGPU ----------------------------------------------
+NODES=()
+for n in /dev/dri/by-path/pci-"$GPU"-card /dev/dri/by-path/pci-"$GPU"-render; do
+  [[ -e "$n" ]] && NODES+=("$(readlink -f "$n")")
+done
+[[ -e /dev/kfd ]] && NODES+=(/dev/kfd)   # ROCm/HIP compute (shared with an AMD iGPU)
+# NVIDIA's proprietary driver exposes /dev/nvidiaN; find N for this GPU.
+nv_info=/proc/driver/nvidia/gpus/$GPU/information
+if [[ -r "$nv_info" ]]; then
+  nv_minor=$(awk -F': *' '/Device Minor/{print $2}' "$nv_info")
+  [[ -n "$nv_minor" && -e /dev/nvidia$nv_minor ]] && NODES+=("/dev/nvidia$nv_minor")
+fi
+
+is_allowed() { local c; for c in "${ALLOW_COMM[@]}"; do [[ "$1" == "$c" ]] && return 0; done; return 1; }
+
+declare -A USERS=()   # pid -> "node node ..."
+# fuser (psmisc) reports PIDs with the node open or mapped; one call per node is
+# far faster than walking every /proc/*/fd entry from bash.
+for n in "${NODES[@]}"; do
+  for pid in $(fuser "$n" 2>/dev/null); do
+    [[ "$pid" == "$$" ]] && continue
+    USERS[$pid]+="${n##*/} "
+  done
+done
+
+# Our own ancestors (sudo, shell, terminal emulator), to spot a terminal that
+# itself holds the eGPU (e.g. Ptyxis, a GTK 4 app).
+declare -A ANCESTORS=()
+p=$PPID
+while [[ "$p" =~ ^[0-9]+$ ]] && (( p > 1 )); do
+  ANCESTORS[$p]=1
+  # field 4 of stat is the parent PID; strip "pid (comm) " first, comm may contain spaces
+  p=$(sed 's/.*) //' /proc/"$p"/stat 2>/dev/null | awk '{print $2}')
+done
+
+blockers=() desktop_apps=() own_terminal=()
+for pid in "${!USERS[@]}"; do
+  comm=$(cat /proc/"$pid"/comm 2>/dev/null || echo '?')
+  user=$(stat -c %U /proc/"$pid" 2>/dev/null || echo '?')
+  nodes=$(tr ' ' '\n' <<<"${USERS[$pid]}" | sort -u | xargs)
+  if is_allowed "$comm"; then
+    echo "     allowed : pid $pid $comm ($user) — $nodes"
+  else
+    blockers+=("pid $pid $comm ($user) — $nodes :: $(tr '\0' ' ' </proc/"$pid"/cmdline 2>/dev/null | cut -c1-100)")
+    # A user process holding only the render node is typically an Electron or
+    # GTK 4 desktop app that opened every GPU at startup without using it.
+    [[ "$user" != root && "$nodes" =~ ^renderD[0-9]+$ ]] && desktop_apps+=("$comm")
+    [[ -n "${ANCESTORS[$pid]:-}" ]] && own_terminal+=("$comm (pid $pid)")
+  fi
+done
+if (( ${#blockers[@]} )); then
+  warn "Processes using the eGPU (stop them first):"
+  printf '       %s\n' "${blockers[@]}"
+  BLOCKED=1
+  if (( ${#desktop_apps[@]} )); then
+    apps=$(printf '%s\n' "${desktop_apps[@]}" | sort -u | xargs | sed 's/ /, /g')
+    info "Tip: $apps only hold the render node. Electron apps (Orca IDE, VS Code, ...)"
+    echo "     and GTK 4 apps (Ptyxis, ...) open every GPU when they start, even if they don't"
+    echo "     use it. Save your work and quit them completely (for Ptyxis, close every window),"
+    echo "     then re-run; reopen them after the detach. Next time, start them before egpu-on."
+    echo "     Don't use --force for them: their GPU process can crash. See runbook §4 step 2."
+  fi
+  if (( ${#own_terminal[@]} )); then
+    warn "You're running egpu-off from a terminal that holds the eGPU: ${own_terminal[*]}."
+    echo "     Close it and run egpu-off from a text console (Ctrl+Alt+F3) or SSH instead."
+  fi
+else
+  ok "No blocking processes on ${NODES[*]:-<no nodes>}"
+fi
+
+if (( GUI_BLOCKED )); then
+  err "Not safe to detach while GNOME manages the eGPU in an active session. Log out first,"
+  err "install the mutter-device-ignore rule for next time, or re-run with"
+  err "--allow-graphical-session to accept the crash risk (--force does not override this)."
+  exit 2
+fi
+if (( BLOCKED )); then
+  if (( FORCE )); then
+    warn "--force given: continuing anyway. Listed apps may crash."
+  else
+    err "Not safe to detach. Resolve the above, or re-run with --force."
+    exit 2
+  fi
+fi
+
+# --- 5. Remove PCI functions --------------------------------------------------
+# Order: every non-GPU function (HDMI audio etc.) first, the GPU itself last.
+ORDER=()
+for f in "${FUNCS[@]}"; do [[ "$f" != "$GPU" ]] && ORDER+=("$f"); done
+ORDER+=("$GPU")
+
+if (( DRY_RUN )); then
+  info "[dry-run] Would remove, in order: ${ORDER[*]}"
+  exit 0
+fi
+
+if (( ! YES )); then
+  read -r -p "Detach eGPU (${ORDER[*]}) now? [y/N] " ans
+  [[ "$ans" =~ ^[Yy]$ ]] || { err "Aborted."; exit 4; }
+fi
+
+# Make sure the device is awake before removal (runtime PM is normally
+# disabled by /etc/udev/rules.d/80-egpu-no-runpm.rules anyway).
+echo on > "$SYS_PCI/$GPU/power/control" 2>/dev/null || true
+
+for f in "${ORDER[@]}"; do
+  [[ -e $SYS_PCI/$f ]] || continue
+  info "Removing $f ..."
+  # The write can block inside the driver; run it in the background so we can time out.
+  ( echo 1 > "$SYS_PCI/$f/remove" ) &
+  wpid=$!
+  for ((i = 0; i < EGPU_REMOVE_TIMEOUT; i++)); do
+    kill -0 "$wpid" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "$wpid" 2>/dev/null; then
+    err "Removing $f did not finish within ${EGPU_REMOVE_TIMEOUT}s (stuck in the driver)."
+    err "Do NOT power off yet. Check: ps -eo pid,stat,comm | awk '\$2 ~ /D/'  (runbook T6)."
+    exit 3
+  fi
+  wait "$wpid" || { err "Removing $f failed."; exit 3; }
+done
+
+# --- 6. Verify ----------------------------------------------------------------
+sleep 1
+if [[ -e "$SYS_PCI/$GPU" ]]; then
+  err "eGPU still present on the PCI bus after removal: $(egpu_name "$GPU")"
+  exit 3
+fi
+
+errs=$(journalctl -k --no-pager -q --since "$START_TS" 2>/dev/null \
+        | grep -iE 'error|fail|hung|timeout' \
+        | grep -vE 'UNLOAD_TA|psp ring|BAR' || true)
+if [[ -n "$errs" ]]; then
+  warn "Unexpected kernel messages during removal (review before powering off):"
+  echo "$errs" | tail -10 | sed 's/^/       /'
+fi
+
+echo
+ok "${c_bld}eGPU detached. It is now safe to power off the enclosure and/or unplug the cable.${c_off}"
+echo "     To re-attach without unplugging:  egpu-on"

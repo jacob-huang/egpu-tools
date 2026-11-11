@@ -1,0 +1,16 @@
+# Installed by egpu-tools (https://github.com/jacob-huang/egpu-tools)
+#
+# Tell GNOME/mutter not to manage the display device of an eGPU: the DRM card
+# node of any display-class PCI device the kernel marks "removable" (behind a
+# Thunderbolt/USB4 port). mutter then never opens /dev/dri/cardN for it, so a
+# hot-remove (egpu-off) can't leave stale KMS state that later aborts GNOME
+# Shell ("meta_kms_update_mode_set: assertion failed", mutter#4705, LP#2149858).
+#
+# Trade-off: monitors plugged into the eGPU's own DP/HDMI outputs won't work in
+# GNOME. Rendering on the eGPU (DRI_PRIME=1, Vulkan, llama.cpp, ROCm, CUDA) is
+# unaffected because it uses the render node, not the card node. Skip this rule
+# (install.sh --no-mutter-ignore) if you drive monitors from the eGPU.
+#
+# mutter reads the tag when the card appears: after installing, (re)connect the
+# eGPU, ideally while logged out of GNOME. Harmless on non-GNOME desktops.
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ENV{DEVTYPE}=="drm_minor", SUBSYSTEMS=="pci", ATTRS{class}=="0x03*", ATTRS{removable}=="removable", TAG+="mutter-device-ignore"
