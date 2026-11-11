@@ -120,6 +120,7 @@ etc/                 egpu-tools.conf, the default config
 docs/RUNBOOK.md      operations runbook for the reference setup
 install.sh           installer and uninstaller
 tests/run.sh         offline tests (no eGPU, root or sudo needed)
+LICENSE              MIT
 ```
 
 ```bash
@@ -128,3 +129,7 @@ tests/run.sh                      # syntax, ShellCheck, CLI, config parser, dete
 ```
 
 Run the scripts from the checkout with `bin/egpu-off --dry-run`. Real attach and detach runs need the hardware. CI runs `tests/run.sh` on every push.
+
+## License
+
+[MIT](LICENSE)
