@@ -5,7 +5,7 @@
 # Everything here is read-only: detection, session checks, output helpers.
 # Changes to the system (PCI remove/rescan, sysfs writes) live in the scripts.
 
-EGPU_TOOLS_VERSION="1.1.0"
+EGPU_TOOLS_VERSION="1.1.1"
 
 # --- Output -------------------------------------------------------------------
 c_red=$'\e[31m' c_grn=$'\e[32m' c_yel=$'\e[33m' c_bld=$'\e[1m' c_off=$'\e[0m'
