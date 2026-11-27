@@ -75,11 +75,12 @@ Both commands ask for your password once (they re-run themselves with `sudo`). T
         Driver   : amdgpu
         Vulkan   : AMD Radeon RX 7900 XTX (RADV NAVI31)
         Link     : 20.0 Gb/s x2 rx / 20.0 Gb/s x2 tx
+        Power    : 339 W limit
         GNOME    : ignored by GNOME (mutter-device-ignore) - egpu-off works while logged in
         Use it   : DRI_PRIME=1 <app>   |   MESA_VK_DEVICE_SELECT=1002:744c! <app>
    ```
 
-   The **GNOME** line tells you whether you can detach later without logging out. `egpu-on` refuses (exit `5`) to attach while you're logged in to GNOME if the GNOME rule isn't installed, since you'd have to log out to detach it again.
+   The **GNOME** line tells you whether you can detach later without logging out. `egpu-on` refuses (exit `5`) to attach while you're logged in to GNOME if the GNOME rule isn't installed, since you'd have to log out to detach it again. The **Power** line should show the card's normal limit; if it reads 0 W, `egpu-on` warns and the card stays slow (see [T10](docs/RUNBOOK.md#t10-power-limit-reads-0-w-and-the-clocks-stay-at-the-lowest-step)).
 
 ### Use the eGPU
 
@@ -147,7 +148,7 @@ Exit codes are stable, so you can script around them:
 
 ## Common issues and troubleshooting
 
-Work through the symptom that matches. The runbook's [troubleshooting section](docs/RUNBOOK.md#6-troubleshooting) has the full checks (T1–T9) and a [diagnostics bundle](docs/RUNBOOK.md#collect-diagnostics-for-a-bug-report) for bug reports.
+Work through the symptom that matches. The runbook's [troubleshooting section](docs/RUNBOOK.md#6-troubleshooting) has the full checks (T1–T10) and a [diagnostics bundle](docs/RUNBOOK.md#collect-diagnostics-for-a-bug-report) for bug reports.
 
 **`egpu-on` says the enclosure isn't detected (exit `2`)**
 1. Check the enclosure is powered on: power cord, PSU switch, power LED or fans.
@@ -185,6 +186,9 @@ GNOME managed the card when it was removed ([mutter#4705](https://gitlab.gnome.o
 
 **An app runs on the internal GPU instead of the eGPU**
 Launch it with `DRI_PRIME=1` or `MESA_VK_DEVICE_SELECT` (see [Use the eGPU](#use-the-egpu) and [T7](docs/RUNBOOK.md#t7-app-runs-on-the-igpu-instead-of-the-egpu)).
+
+**The eGPU is slow and `egpu-on` warns that its power limit reads 0 W**
+The kernel thinks the PC runs on battery, so amdgpu applies the card's battery (DC) limit and the card stays at its lowest clocks. On some desktops the USB-C driver (`ucsi_acpi`) makes the ports look like offline power supplies. Blacklist it, then re-probe the card with `egpu-off` and `egpu-on`. See [T10](docs/RUNBOOK.md#t10-power-limit-reads-0-w-and-the-clocks-stay-at-the-lowest-step).
 
 **Performance is lower than expected**
 - `boltctl list` should show `40 Gb/s = 2 lanes * 20 Gb/s`; less means a cable or port problem.

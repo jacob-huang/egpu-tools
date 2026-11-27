@@ -84,7 +84,7 @@ write_specs() {
   echo "host model  : $(rd /sys/class/dmi/id/sys_vendor) $(rd /sys/class/dmi/id/product_name) (board $(rd /sys/class/dmi/id/board_name), BIOS $(rd /sys/class/dmi/id/bios_version) $(rd /sys/class/dmi/id/bios_date))"
   echo "cpu         : $(lscpu | sed -n 's/^Model name: *//p'), $(nproc) threads, max $(lscpu | sed -n 's/^CPU max MHz: *//p' | cut -d. -f1) MHz"
   echo "cpu governor: $(rd /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor), EPP $(rd /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference), platform profile $(rd /sys/firmware/acpi/platform_profile)"
-  echo "on AC power : $(for s in /sys/class/power_supply/*; do [[ "$(rd "$s/type")" == Mains ]] && echo -n "${s##*/}=$(rd "$s/online") "; done; true)(empty = desktop, no AC adapter reported)"
+  echo "on mains    : $(egpu_on_mains && echo yes || echo "NO - kernel thinks it's on battery; offline: $(egpu_offline_supplies) (runbook T10)")"
   echo "memory      : $(free -m | awk '/^Mem:/{print $2" MiB visible"}')"
   echo "os          : $(sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d '"'), kernel $(uname -r)"
   echo "mesa        : $(DRI_PRIME=$PRIME_TAG glxinfo -B 2>/dev/null | grep -o 'Mesa [^ ]*' | head -1)"
@@ -139,7 +139,9 @@ cat "$OUT/specs.txt"
 
 echo idle >"$PHASE_FILE"
 logger_loop & LOGGER=$!
-trap 'kill "$LOGGER" 2>/dev/null; rm -f "$PHASE_FILE"' EXIT
+# "|| true": the logger is already stopped at a normal exit, and a failed kill in
+# the trap would otherwise turn the exit code into 1 under set -e.
+trap 'kill "$LOGGER" 2>/dev/null || true; rm -f "$PHASE_FILE"' EXIT
 
 phase idle;       sleep 5
 phase 1080p-vk;   run vk -s 1920x1080

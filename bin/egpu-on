@@ -11,6 +11,8 @@
 #                                          plug in the cable, authorizes it if
 #                                          needed, then rescans
 # Finally it makes sure runtime PM is off and checks that Vulkan sees the GPU.
+# It warns if the card's power limit reads 0 W, which keeps it at its lowest
+# clocks, and says whether the kernel thinks the PC runs on battery (runbook T10).
 #
 # The eGPU is the first display device behind a Thunderbolt/USB4 port; the
 # enclosure is the first Thunderbolt/USB4 device. Set EGPU_PCI_ID and
@@ -252,6 +254,17 @@ fi
 TB=$(egpu_tb_dev)
 link="?"
 [[ -n "$TB" ]] && link="$(cat "$TB/rx_speed" 2>/dev/null) x$(cat "$TB/rx_lanes" 2>/dev/null) rx / $(cat "$TB/tx_speed" 2>/dev/null) x$(cat "$TB/tx_lanes" 2>/dev/null) tx"
+# A 0 W power limit leaves the card at its lowest clocks: usually amdgpu applying
+# the DC (battery) limit because the kernel thinks the PC isn't on mains.
+cap=$(egpu_power_cap "$GPU")
+if [[ "$cap" == 0 ]]; then
+  warn "The eGPU's power limit reads 0 W: it will stay at its lowest clocks (runbook T10)."
+  if ! egpu_on_mains; then
+    warn "The kernel thinks this PC runs on battery: no mains supply, and these are offline:"
+    warn "  $(egpu_offline_supplies). amdgpu then applies the card's DC power limit."
+    warn "Fix: see runbook T10 (on many desktops: blacklist ucsi_acpi), then egpu-off and egpu-on."
+  fi
+fi
 vram=""
 [[ -r "$DEV/mem_info_vram_total" ]] && vram="$(( $(cat "$DEV/mem_info_vram_total") / 1024 / 1024 )) MB"
 
@@ -268,6 +281,7 @@ echo "     Vulkan   : $vk"
 [[ -n "$vram" ]] && echo "     VRAM     : $vram"
 echo "     Link     : $link"
 echo "     Runtime PM: $(cat "$DEV/power/control") / $(egpu_rpm "$GPU")"
+[[ -n "$cap" ]] && echo "     Power    : ${cap} W limit"
 echo "     GNOME    : $gnome_state"
 echo "     Use it   : $(egpu_offload_hint "$DRIVER" "$PCI_ID")"
 echo

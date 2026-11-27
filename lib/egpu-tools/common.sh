@@ -5,7 +5,7 @@
 # Everything here is read-only: detection, session checks, output helpers.
 # Changes to the system (PCI remove/rescan, sysfs writes) live in the scripts.
 
-EGPU_TOOLS_VERSION="1.0.0"
+EGPU_TOOLS_VERSION="1.1.0"
 
 # --- Output -------------------------------------------------------------------
 c_red=$'\e[31m' c_grn=$'\e[32m' c_yel=$'\e[33m' c_bld=$'\e[1m' c_off=$'\e[0m'
@@ -88,6 +88,50 @@ egpu_pci_id()  { local d=$SYS_PCI/$1; echo "$(sed 's/^0x//' "$d/vendor"):$(sed '
 egpu_driver()  { local l; l=$(readlink "$SYS_PCI/$1/driver" 2>/dev/null) && basename "$l"; return 0; }
 egpu_rpm()     { cat "$SYS_PCI/$1/power/runtime_status" 2>/dev/null || echo '?'; }
 egpu_name()    { lspci -s "$1" 2>/dev/null | cut -d: -f3- | sed 's/^ //'; }
+
+# Power limit of the eGPU in watts (hwmon power1_cap), or empty if not reported.
+egpu_power_cap() {
+  local h
+  for h in "$SYS_PCI/$1"/hwmon/hwmon*; do
+    [[ -r "$h/power1_cap" ]] || continue
+    echo $(( $(cat "$h/power1_cap") / 1000000 )); return 0
+  done
+}
+
+# --- Mains power ------------------------------------------------------------------
+# amdgpu applies the card's AC or DC (battery) power limits depending on whether
+# the kernel thinks the system runs on mains. On a desktop graphics card the DC
+# limit can be 0 W, which pins the eGPU at its lowest clocks (runbook T10).
+SYS_PSU=/sys/class/power_supply
+
+# True if the kernel considers the system on mains power, mirroring the kernel's
+# power_supply_is_system_supplied(): skip batteries and Device-scope supplies (a
+# mouse battery); no remaining supply at all means a desktop on mains, otherwise
+# at least one of them must be online. Some desktops register their USB-C ports
+# (ucsi_acpi) as offline System supplies and so look like they run on battery.
+egpu_on_mains() {
+  local s n=0
+  for s in "$SYS_PSU"/*; do
+    [[ -r "$s/type" ]] || continue
+    [[ "$(cat "$s/type")" == Battery ]] && continue
+    [[ "$(cat "$s/scope" 2>/dev/null)" == Device ]] && continue
+    n=$((n + 1))
+    [[ "$(cat "$s/online" 2>/dev/null)" == 1 ]] && return 0
+  done
+  (( n == 0 ))
+}
+
+# Names of the System-scope, non-battery supplies that are offline, space-separated.
+egpu_offline_supplies() {
+  local s out=()
+  for s in "$SYS_PSU"/*; do
+    [[ -r "$s/type" ]] || continue
+    [[ "$(cat "$s/type")" == Battery ]] && continue
+    [[ "$(cat "$s/scope" 2>/dev/null)" == Device ]] && continue
+    [[ "$(cat "$s/online" 2>/dev/null)" == 1 ]] || out+=("${s##*/}")
+  done
+  echo "${out[*]}"
+}
 
 # Healthy = a driver is bound, runtime PM is not in error, and the DRM render node exists.
 egpu_healthy() {

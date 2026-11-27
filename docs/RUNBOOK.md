@@ -114,6 +114,8 @@ Both refusals exit with `5` and can be overridden with `--allow-graphical-sessio
 
 **`egpu-on` summary tip** (same as the `--help` output). After a successful run, the summary ends with a tip: Electron apps (Orca IDE, VS Code) and GTK 4 apps (Ptyxis) started from now on open the eGPU even if they don't use it, and they block `egpu-off` until you quit them. Start such apps before `egpu-on` when you can. See the tip in §4 step 2.
 
+**`egpu-on` power-limit check** (same as the `--help` output). The summary shows the card's power limit (`Power : 339 W limit`). If it reads 0 W, `egpu-on` warns that the card will stay at its lowest clocks. If the kernel thinks the PC runs on battery, it also lists the offline power supplies behind that. The exit code doesn't change. See [T10](#t10-power-limit-reads-0-w-and-the-clocks-stay-at-the-lowest-step).
+
 **`egpu-off` desktop-app tip** (same as the `--help` output). Electron apps (such as Orca IDE or VS Code) and GTK 4 apps (such as Ptyxis) open every GPU at startup. If one of these, a user app holding only the eGPU's render node, is blocking the detach, `egpu-off` prints a tip:
 
 - quit the app and reopen it after the detach;
@@ -192,7 +194,7 @@ sequenceDiagram
 > | On the bus but broken (T5 hang) | Asks, then PCI remove and rescan (`-y` skips the prompt) |
 > | Already healthy | Reports status only |
 >
-> It then makes sure runtime PM is off, checks Vulkan sees the RX 7900 XTX, and prints the PCI address, VRAM, USB4 link speed and a **GNOME** line saying whether GNOME manages the eGPU (if it does, log out before `egpu-off`), plus a tip that Electron/GTK 4 apps started from then on will open the eGPU and block `egpu-off` until you quit them. Exit codes: `0` online, `2` enclosure not detected, `3` GPU didn't come up or is unhealthy, `4` aborted, `5` blocked by the session check.
+> It then makes sure runtime PM is off, checks Vulkan sees the RX 7900 XTX, and prints the PCI address, VRAM, USB4 link speed, power limit (with a warning if it reads 0 W, see [T10](#t10-power-limit-reads-0-w-and-the-clocks-stay-at-the-lowest-step)) and a **GNOME** line saying whether GNOME manages the eGPU (if it does, log out before `egpu-off`), plus a tip that Electron/GTK 4 apps started from then on will open the eGPU and block `egpu-off` until you quit them. Exit codes: `0` online, `2` enclosure not detected, `3` GPU didn't come up or is unhealthy, `4` aborted, `5` blocked by the session check.
 >
 > **Session check.** While a GNOME/X11 session is active, `egpu-on` refuses (exit `5`) to attach the eGPU if `/etc/udev/rules.d/81-egpu-mutter-ignore.rules` is missing, because GNOME would take the card and you couldn't detach it later without logging out. It also refuses to re-initialize a broken GPU that `gnome-shell` holds, since that removal is the crash in "Known risk". Override with `--allow-graphical-session`. Run from a text console or SSH while logged out, nothing is refused.
 >
@@ -440,7 +442,9 @@ flowchart TD
     E -- yes --> T5["T5: runtime PM hang<br/>remove and rescan"]
     E -- no --> F{"App runs on iGPU<br/>instead?"}
     F -- yes --> T7["T7: GPU selection"]
-    F -- no --> G{"Slow / stutter?"}
+    F -- no --> P{"Power limit 0 W,<br/>clocks stuck at the<br/>lowest step?"}
+    P -- yes --> T10["T10: kernel thinks<br/>the PC is on battery"]
+    P -- no --> G{"Slow / stutter?"}
     G -- yes --> T8["T8: performance"]
     G -- no --> H{"Monitor on eGPU<br/>is black?"}
     H -- yes --> T9["T9: eGPU display output"]
@@ -476,8 +480,9 @@ journalctl -k -b | grep "$GPU" | grep -iE 'error|fail|firmware'
 - `BAR 0 ... failed to assign` / `Not enough PCI address space for a large BAR` is **expected** and harmless. It only means Resizable BAR is off.
 - **`ring gfx_0.0.0 test failed (-110)` → `Fatal error during GPU init`, or `device lost from bus!` during probe:** the GPU failed partway through initialization. Seen on 2026-11-26 on a second host:
   - **After booting with the enclosure on.** The kernel reset the USB4 tunnel at about 5 s into boot (`pciehp: Card present`, `ACSViol` AER errors), then the probe failed. A PCI remove and rescan (`egpu-on -y`) didn't help, and left the enclosure's PCIe bridges unreachable (`device inaccessible`, `bridge configuration invalid ([bus ff-ff])`).
-  - **After a plain power-cycle.** The card went through SMU and display init, then dropped off the bus (`device lost from bus!`) as the driver brought it up to working power, with no lights and no fans on the enclosure.
-  - **Fix that worked: treat it as a power-delivery fault.** Switch the enclosure off, then unplug the AC cord and the USB4 cable. Reseat every PCIe power connector on the GPU (and at the PSU, if modular), leave AC unplugged for about a minute so the PSU resets, then power on and plug the cable back in. If the card still drops off the bus with every connector seated, suspect the enclosure's PSU.
+  - **After a plain power-cycle.** The card went through SMU and display init, then dropped off the bus (`device lost from bus!`) as the driver brought it up to working power.
+  - **What worked: a full power reset.** Switch the enclosure off, then unplug the AC cord and the USB4 cable. Reseat every PCIe power connector on the GPU (and at the PSU, if modular), leave AC unplugged for about a minute so the PSU resets, then power on and plug the cable back in.
+  - **Not the PSU:** later the same enclosure held the card's full 339 W on both hosts, so the trigger of these failures is unknown. If the card keeps failing with every connector seated, try another host before suspecting the PSU. Fans at 0 rpm at idle are normal for this card. A card that comes up but stays at its lowest clocks is a different problem: see [T10](#t10-power-limit-reads-0-w-and-the-clocks-stay-at-the-lowest-step).
   - The `ACSViol` errors on the host's Thunderbolt root port and a single `pci_channel_io_perm_failure` notice to `amdgpu` also appear on every successful hot-plug on that host, so they don't indicate a problem on their own.
 
 ### T5. Runtime PM hang: card dead but still on the bus
@@ -551,6 +556,30 @@ GNOME uses the iGPU as its primary GPU, so apps run there by default. Choose the
 - Confirm the connector shows up with `for c in /sys/class/drm/card*-*; do echo "$(basename $c): $(cat $c/status)"; done`. The eGPU outputs are those on the card whose `device` link points to `$GPU`.
 - Try a different eGPU output (DP vs HDMI) and cable.
 - GNOME: toggle the display in *Settings → Displays*, or log out and back in.
+
+### T10. Power limit reads 0 W and the clocks stay at the lowest step
+
+**Symptom:** the eGPU works (Vulkan sees it) but benchmarks run at about a third of normal speed. Under load it's busy (90%+) yet stays at its lowest clock steps (about 500 MHz core, 96 MHz memory) and draws about 20 W. `egpu-on` warns that the power limit reads 0 W.
+
+```bash
+GPU=$(lspci -D -d 1002:744c | awk '{print $1}')
+cat /sys/bus/pci/devices/$GPU/hwmon/hwmon*/power1_cap      # 0 = the problem; normally ~339000000
+grep -H . /sys/class/power_supply/*/{type,scope,online}    # what the kernel counts as power sources
+```
+
+**Cause:** amdgpu applies the card's AC or DC (battery) power limits, depending on whether the kernel thinks the PC runs on mains. The kernel says "on mains" if there's no System-scope power supply at all (a normal desktop) or if at least one is online. Some desktops register their USB-C ports as System-scope `USB` supplies through `ucsi_acpi` (`ucsi-source-psy-USBC000:00x`). With no `Mains` supply and those ports offline, the kernel concludes the PC is on battery, and on a desktop graphics card the DC limit is 0 W. Seen 2026-11-26 on a Dell Pro Micro Plus (Intel Arrow Lake). Batteries and Device-scope supplies, such as a wireless mouse, don't count.
+
+**Fix:** stop `ucsi_acpi` from registering the ports, then re-probe the eGPU (amdgpu only reads the power source when the card starts):
+
+```bash
+echo "blacklist ucsi_acpi" | sudo tee /etc/modprobe.d/egpu-no-ucsi.conf   # permanent, from the next boot
+sudo modprobe -r ucsi_acpi                                                # now, without rebooting
+egpu-off && egpu-on                                                       # the power limit should now read ~339 W
+```
+
+Trade-off: `/sys/class/typec` (USB-C role and alt-mode status) disappears. USB-C ports and the USB4 eGPU port keep working, because the firmware manages them. Check that `ucsi_acpi` isn't in your initramfs (`lsinitramfs /boot/initrd.img-$(uname -r) | grep ucsi`); if it is, run `sudo update-initramfs -u` too. To undo, delete the file and reboot.
+
+Ruled out on that host: the enclosure's PSU (the same card holds 339 W on the reference host) and the PCIe `ACSViol` errors on its Thunderbolt root port (booting with `pci=noaer` removed the error reports, but the 0 W limit remained).
 
 ### Collect diagnostics for a bug report
 ```bash
@@ -738,3 +767,4 @@ Re-checks, the full-load stress test at 8K (the card holds its 339 W limit), hos
 | 2026-11-26 | `egpu-on` / `egpu-off`: the driver lookup no longer reports `driver` for a GPU with no driver bound (`readlink -f` succeeded on the missing link), so health checks and status lines now see an unbound card as unbound. T4: added the failed-init case (`ring gfx test failed (-110)`, `device lost from bus!`) seen on a second host after booting with the enclosure on, fixed by reseating the GPU power connectors and draining the PSU; §3 notes that booting with the eGPU attached failed there. |
 | 2026-11-26 | README reorganized: purpose, install, a step-by-step user guide (connect, use, disconnect, start-up and shut-down order, command reference with every option and exit code), then common issues and troubleshooting linked to T1–T9. |
 | 2026-11-26 | Benchmarks: added `tools/egpu-bench` (read-only benchmark with power log) and `docs/reference-benchmarks.md` (hardware specs, 1080p re-checks, 8K full-load run: the card holds its 339 W limit at a 96 °C hotspot peak, and the enclosure PSU sustains it). §8 links to it. |
+| 2026-11-26 | Version 1.1.0. New T10: a 0 W power limit keeps the eGPU at its lowest clocks when the kernel thinks the PC runs on battery. Seen on a Dell Pro Micro Plus, whose USB-C ports (`ucsi_acpi`) register as offline power supplies; fixed by blacklisting `ucsi_acpi`. `egpu-on` shows the power limit and warns at 0 W (exit codes unchanged); `egpu-bench` reports `on mains` and no longer exits 1 on success. T4: the enclosure PSU was ruled out. `reference-benchmarks.md`: Host B specs and results, including a Balanced vs Performance comparison. |
