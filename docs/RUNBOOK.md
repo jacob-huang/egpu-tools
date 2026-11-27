@@ -221,7 +221,7 @@ boltctl list                                     # copy the uuid
 sudo boltctl enroll --policy auto <uuid>
 ```
 
-**Booting with the eGPU already attached** also works. Power the enclosure on before the PC so the GPU is enumerated at boot.
+**Booting with the eGPU already attached** works on the reference host. Power the enclosure on before the PC so the GPU is enumerated at boot. On a second host (Intel Arrow Lake, same OS and kernel) it failed once: the kernel reset the USB4 PCIe tunnel during boot and `amdgpu` failed to initialize the GPU (see [T4](#t4-gpu-present-but-amdgpu-didnt-bind)). If that happens on your machine, connect the eGPU after logging in instead.
 
 ---
 
@@ -474,6 +474,11 @@ journalctl -k -b | grep "$GPU" | grep -iE 'error|fail|firmware'
 ```
 - Firmware errors: check that the `linux-firmware` package is up to date.
 - `BAR 0 ... failed to assign` / `Not enough PCI address space for a large BAR` is **expected** and harmless. It only means Resizable BAR is off.
+- **`ring gfx_0.0.0 test failed (-110)` → `Fatal error during GPU init`, or `device lost from bus!` during probe:** the GPU failed partway through initialization. Seen on 2026-11-26 on a second host:
+  - **After booting with the enclosure on.** The kernel reset the USB4 tunnel at about 5 s into boot (`pciehp: Card present`, `ACSViol` AER errors), then the probe failed. A PCI remove and rescan (`egpu-on -y`) didn't help, and left the enclosure's PCIe bridges unreachable (`device inaccessible`, `bridge configuration invalid ([bus ff-ff])`).
+  - **After a plain power-cycle.** The card went through SMU and display init, then dropped off the bus (`device lost from bus!`) as the driver brought it up to working power, with no lights and no fans on the enclosure.
+  - **Fix that worked: treat it as a power-delivery fault.** Switch the enclosure off, then unplug the AC cord and the USB4 cable. Reseat every PCIe power connector on the GPU (and at the PSU, if modular), leave AC unplugged for about a minute so the PSU resets, then power on and plug the cable back in. If the card still drops off the bus with every connector seated, suspect the enclosure's PSU.
+  - The `ACSViol` errors on the host's Thunderbolt root port and a single `pci_channel_io_perm_failure` notice to `amdgpu` also appear on every successful hot-plug on that host, so they don't indicate a problem on their own.
 
 ### T5. Runtime PM hang: card dead but still on the bus
 **This is the known failure on this setup** (first seen 2026-11-10).
@@ -728,3 +733,4 @@ These benchmarks are light, and most scenes hit the CPU and link limit of about 
 | 2026-11-11 | Restructured into the egpu-tools project: scripts moved to `bin/` (no `.sh`), shared helpers in `lib/egpu-tools/common.sh`, this runbook in `docs/`, a one-line `install.sh`, and offline tests in `tests/run.sh`. The scripts now auto-detect the eGPU (first removable display device) and enclosure, with optional `/etc/egpu-tools.conf`. Both udev rules now match any removable display device instead of `1002:744c` (verified with `udevadm test`). Removed the hostname and home paths from this runbook. |
 | 2026-11-11 | Installed egpu-tools system-wide on the reference host with `sudo ./install.sh`: scripts in `/usr/local/bin`, library in `/usr/local/lib/egpu-tools`, docs in `/usr/local/share/doc/egpu-tools`, default `/etc/egpu-tools.conf`, and the generic 80/81 udev rules (both pass `udevadm verify`; `udevadm test` shows rule 81 tags the eGPU card, not the iGPU card). Removed the old `~/.local/bin` symlinks and the backup of the original `1002:744c` rule 81. The new rules apply from the next connect. |
 | 2026-11-26 | `egpu-off`: when the eGPU is untagged but rule 81 is already installed (eGPU connected before the install), it now says to reconnect while logged out instead of to install the rule. Its post-detach kernel-log check only reports messages about the eGPU's PCI slot or Thunderbolt. `egpu-on`: removing the other functions (HDMI audio) during a T5 re-initialize now times out like the GPU removal (exit `3`). |
+| 2026-11-26 | `egpu-on` / `egpu-off`: the driver lookup no longer reports `driver` for a GPU with no driver bound (`readlink -f` succeeded on the missing link), so health checks and status lines now see an unbound card as unbound. T4: added the failed-init case (`ring gfx test failed (-110)`, `device lost from bus!`) seen on a second host after booting with the enclosure on, fixed by reseating the GPU power connectors and draining the PSU; §3 notes that booting with the eGPU attached failed there. |

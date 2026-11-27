@@ -83,7 +83,9 @@ egpu_gpu_addr() {
 }
 
 egpu_pci_id()  { local d=$SYS_PCI/$1; echo "$(sed 's/^0x//' "$d/vendor"):$(sed 's/^0x//' "$d/device")"; }
-egpu_driver()  { local l; l=$(readlink -f "$SYS_PCI/$1/driver" 2>/dev/null) && basename "$l"; return 0; }
+# Plain readlink (not -f): it fails when the driver link is missing, so an
+# unbound device prints nothing instead of "driver".
+egpu_driver()  { local l; l=$(readlink "$SYS_PCI/$1/driver" 2>/dev/null) && basename "$l"; return 0; }
 egpu_rpm()     { cat "$SYS_PCI/$1/power/runtime_status" 2>/dev/null || echo '?'; }
 egpu_name()    { lspci -s "$1" 2>/dev/null | cut -d: -f3- | sed 's/^ //'; }
 
