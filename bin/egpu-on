@@ -78,10 +78,13 @@ WAIT_TB=${WAIT_ARG:-$EGPU_WAIT_TB}
 START_TS=$(date '+%Y-%m-%d %H:%M:%S')
 
 pci_remove_gpu() {
-  local g=$1 slot=${1%.*} f
+  local g=$1 slot=${1%.*} f rc
+  # Other functions (HDMI audio etc.) first. Each write can block in the driver,
+  # so time it out like the GPU itself.
   for f in "$SYS_PCI/$slot".*; do
-    [[ "$(basename "$f")" == "$g" ]] && continue
-    echo 1 > "$f/remove" 2>/dev/null || true
+    [[ -e "$f" && "$(basename "$f")" != "$g" ]] || continue
+    rc=0; timeout "$EGPU_REMOVE_TIMEOUT" sh -c "echo 1 > $f/remove" 2>/dev/null || rc=$?
+    (( rc != 124 )) || { err "Removing $(basename "$f") timed out (stuck in the driver); see the runbook, T6."; exit 3; }
   done
   timeout "$EGPU_REMOVE_TIMEOUT" sh -c "echo 1 > $SYS_PCI/$g/remove" \
     || { err "Removing $g timed out (stuck in the driver); see the runbook, T6."; exit 3; }
