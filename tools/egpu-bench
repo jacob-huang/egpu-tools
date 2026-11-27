@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# egpu-bench: benchmark an attached eGPU and log its power, for comparing hosts
+# against docs/reference-benchmarks.md.
+#
+# Read-only: needs no root, never attaches, detaches or reconfigures anything.
+# Run it from a clone after `egpu-on` reports the eGPU online. Close games and
+# other GPU work first. Takes about 12 minutes (about 6 with --quick).
+#
+# It writes a report directory with:
+#   specs.txt     host, GPU, enclosure and link details (no serials or UUIDs)
+#   bench.txt     raw benchmark output
+#   powerlog.csv  power, load, clock, temperatures and fan every 0.5 s
+#   summary.txt   results and per-phase power, ready to paste into the doc
+#
+# Phases (same as the reference run):
+#   1. Idle (5 s)
+#   2. 1080p: vkmark --winsys headless, glmark2 --off-screen (link health)
+#   3. 4K: glmark2 terrain, refract, jellyfish, phong
+#   4. 8K: glmark2 terrain, refract (full load)
+#   5. 8K: vkmark blur, phong, texture (full load)
+#   6. Cool-down (8 s)
+#
+# Usage: egpu-bench [-o|--output DIR] [-q|--quick] [-h|--help]
+#   -o, --output DIR  report directory (default ./egpu-bench-<date>-<time>)
+#   -q, --quick       phases 1 and 2 only
+#
+# Needs vkmark and glmark2 (Ubuntu: apt install vkmark glmark2), plus lspci.
+#
+# Exit codes: 0 done, 1 usage or environment error (no eGPU, missing tool)
+
+set -euo pipefail
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+LIB=${SELF%/*}/../lib/egpu-tools/common.sh
+[[ -r "$LIB" ]] || { echo "egpu-bench: can't find $LIB" >&2; exit 1; }
+# shellcheck source=../lib/egpu-tools/common.sh
+. "$LIB"
+
+SYS_PCI=/sys/bus/pci/devices
+SYS_TB=/sys/bus/thunderbolt/devices
+OUT="" QUICK=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o|--output) [[ $# -ge 2 ]] || { err "$1 needs a directory"; exit 1; }; OUT=$2; shift ;;
+    -q|--quick)  QUICK=1 ;;
+    -h|--help)   egpu_usage "$SELF"; exit 0 ;;
+    *)           err "unknown option: $1 (see --help)"; exit 1 ;;
+  esac
+  shift
+done
+
+for t in vkmark glmark2 lspci bc; do
+  command -v "$t" >/dev/null || { err "$t not found (Ubuntu: apt install vkmark glmark2 pciutils bc)"; exit 1; }
+done
+
+egpu_load_config
+ADDR=$(egpu_gpu_addr)
+[[ -n "$ADDR" ]] || { err "no eGPU found; run egpu-on first"; exit 1; }
+egpu_healthy "$ADDR" || { err "eGPU at $ADDR is not healthy; run egpu-on first"; exit 1; }
+DEV=$SYS_PCI/$ADDR
+ID=$(egpu_pci_id "$ADDR")
+HW=$(echo "$DEV"/hwmon/hwmon* | awk '{print $1}')
+[[ -r "$HW/power1_average" || -r "$HW/power1_input" ]] || { err "no power sensor under $HW"; exit 1; }
+PSENSE=$HW/power1_average; [[ -r "$PSENSE" ]] || PSENSE=$HW/power1_input
+
+OUT=${OUT:-./egpu-bench-$(date +%Y%m%d-%H%M%S)}
+mkdir -p "$OUT"
+OUT=$(cd "$OUT" && pwd)
+PHASE_FILE=$OUT/.phase
+
+# Select the eGPU exactly: DRI_PRIME by PCI address, Vulkan by vendor:device.
+PRIME_TAG=pci-${ADDR//[:.]/_}
+gl()  { DRI_PRIME=$PRIME_TAG glmark2 --off-screen "$@"; }
+vk()  { MESA_VK_DEVICE_SELECT="$ID!" vkmark --winsys headless "$@"; }
+
+rd()  { cat "$1" 2>/dev/null || echo "?"; }
+div() { local v; v=$(cat "$1" 2>/dev/null) && echo $(( v / $2 )) || echo "?"; }
+
+# --- Specs ----------------------------------------------------------------------
+write_specs() {
+  local tb a
+  echo "date        : $(date -Iseconds)"
+  echo "host model  : $(rd /sys/class/dmi/id/sys_vendor) $(rd /sys/class/dmi/id/product_name) (board $(rd /sys/class/dmi/id/board_name), BIOS $(rd /sys/class/dmi/id/bios_version) $(rd /sys/class/dmi/id/bios_date))"
+  echo "cpu         : $(lscpu | sed -n 's/^Model name: *//p'), $(nproc) threads, max $(lscpu | sed -n 's/^CPU max MHz: *//p' | cut -d. -f1) MHz"
+  echo "cpu governor: $(rd /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor), EPP $(rd /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference), platform profile $(rd /sys/firmware/acpi/platform_profile)"
+  echo "on AC power : $(for s in /sys/class/power_supply/*; do [[ "$(rd "$s/type")" == Mains ]] && echo -n "${s##*/}=$(rd "$s/online") "; done; true)(empty = desktop, no AC adapter reported)"
+  echo "memory      : $(free -m | awk '/^Mem:/{print $2" MiB visible"}')"
+  # shellcheck disable=SC1091
+  echo "os          : $(. /etc/os-release; echo "$PRETTY_NAME"), kernel $(uname -r)"
+  echo "mesa        : $(DRI_PRIME=$PRIME_TAG glxinfo -B 2>/dev/null | grep -o 'Mesa [^ ]*' | head -1)"
+  echo "desktop     : ${XDG_CURRENT_DESKTOP:-?} ${XDG_SESSION_TYPE:-?} $(gnome-shell --version 2>/dev/null || true)"
+  echo "amdgpu args : $(tr ' ' '\n' </proc/cmdline | grep -E '^(amdgpu|radeon|pcie_|iommu|amd_iommu)' | xargs)"
+  echo
+  echo "gpu         : $ADDR [$ID] $(egpu_name "$ADDR")"
+  echo "subsystem   : $(lspci -s "$ADDR" -v 2>/dev/null | sed -n 's/^\s*Subsystem: //p')"
+  echo "driver      : $(egpu_driver "$ADDR"), vbios $(rd "$DEV/vbios_version"), VRAM $(div "$DEV/mem_info_vram_total" 1048576) MiB"
+  echo "power limit : $(div "$HW/power1_cap" 1000000) W (default $(div "$HW/power1_cap_default" 1000000) W, max $(div "$HW/power1_cap_max" 1000000) W)"
+  echo "perf level  : $(rd "$DEV/power_dpm_force_performance_level"), profile $(grep '\*' "$DEV/pp_power_profile_mode" 2>/dev/null | awk '{print $2}' | tr -d '*:' | head -1)"
+  echo "runtime PM  : $(rd "$DEV/power/control") / $(egpu_rpm "$ADDR")"
+  echo "resizable BAR: BAR0 $(lspci -s "$ADDR" -v 2>/dev/null | awk '/Memory at/{print $NF; exit}')"
+  echo
+  tb=$(egpu_tb_dev)
+  if [[ -n "$tb" ]]; then
+    echo "enclosure   : $(rd "$tb/vendor_name") $(rd "$tb/device_name"), $(rd "$tb/generation" | sed 's/^4$/USB4/;s/^\([123]\)$/Thunderbolt \1/')"
+    echo "tb link     : rx $(rd "$tb/rx_speed") x$(rd "$tb/rx_lanes"), tx $(rd "$tb/tx_speed") x$(rd "$tb/tx_lanes")"
+  else
+    echo "enclosure   : not found under $SYS_TB"
+  fi
+  echo "pcie chain  : (host root port -> enclosure bridges -> GPU)"
+  readlink -f "$DEV" | tr / '\n' | grep -E '^[0-9a-f]{4}:' | while read -r a; do
+    printf '  %s %-70.70s %s x%s\n' "$a" "$(lspci -s "$a" | cut -d' ' -f2-)" \
+      "$(rd "$SYS_PCI/$a/current_link_speed")" "$(rd "$SYS_PCI/$a/current_link_width")"
+  done
+}
+
+# --- Power logger ---------------------------------------------------------------
+logger_loop() {
+  local start now
+  start=$(date +%s.%N)
+  echo "t,phase,power_w,busy_pct,sclk_mhz,edge_c,junction_c,mem_c,fan_rpm,cpu_mhz" >"$OUT/powerlog.csv"
+  while :; do
+    now=$(date +%s.%N)
+    printf '%.1f,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$(bc <<<"$now - $start")" "$(rd "$PHASE_FILE")" \
+      "$(div "$PSENSE" 1000000)" "$(rd "$DEV/gpu_busy_percent")" "$(div "$HW/freq1_input" 1000000)" \
+      "$(div "$HW/temp1_input" 1000)" "$(div "$HW/temp2_input" 1000)" "$(div "$HW/temp3_input" 1000)" \
+      "$(rd "$HW/fan1_input")" "$(awk '/^cpu MHz/{s+=$4; n++} END{if(n) printf "%d", s/n}' /proc/cpuinfo)" \
+      >>"$OUT/powerlog.csv"
+    sleep 0.5
+  done
+}
+
+phase() { echo "$1" >"$PHASE_FILE"; info "phase: $1"; echo "== $1" >>"$OUT/bench.txt"; }
+run()   { "$@" 2>&1 | grep -E '^\s*(\[|Device Name|GL_RENDERER|.*Score)' | tee -a "$OUT/bench.txt"; }
+
+info "eGPU $ADDR [$ID], report in $OUT"
+write_specs >"$OUT/specs.txt"
+cat "$OUT/specs.txt"
+: >"$OUT/bench.txt"
+
+echo idle >"$PHASE_FILE"
+logger_loop & LOGGER=$!
+trap 'kill "$LOGGER" 2>/dev/null; rm -f "$PHASE_FILE"' EXIT
+
+phase idle;       sleep 5
+phase 1080p-vk;   run vk -s 1920x1080
+phase 1080p-gl;   run gl -s 1920x1080
+if [[ $QUICK -eq 0 ]]; then
+  phase 4k-gl;    run gl -s 3840x2160 -b terrain:duration=30 -b refract:duration=30 -b jellyfish:duration=20 -b shading:shading=phong:duration=20
+  phase 8k-gl;    run gl -s 7680x4320 -b terrain:duration=45 -b refract:duration=30
+  phase 8k-vk;    run vk -s 7680x4320 -b effect2d:kernel=blur:duration=25 -b shading:shading=phong:duration=25 -b texture:anisotropy=16:duration=20
+fi
+phase cooldown;   sleep 8
+kill "$LOGGER" 2>/dev/null; wait "$LOGGER" 2>/dev/null || true; rm -f "$PHASE_FILE"
+
+# --- Summary ----------------------------------------------------------------------
+{
+  echo "Scores"
+  awk '/^== /{p=$2} /Score/{print "  " p ": " $NF} /device-local=false/{print "  " p ": vertex device-local=false " $4 " fps"} /\[terrain\]/{print "  " p ": terrain " $(NF-3) " fps"}' "$OUT/bench.txt"
+  echo
+  echo "Power per phase (from powerlog.csv)"
+  awk -F, 'NR>1 && $3 != "?" {
+      p=$2; if (!(p in n)) order[++k]=p
+      n[p]++; w[p]+=$3; if ($3>mw[p]) mw[p]=$3; b[p]+=$4; c[p]+=$5
+      if ($7>tj[p]) tj[p]=$7; if ($9>fan[p]) fan[p]=$9; cpu[p]+=$10 }
+    END {
+      printf "  %-9s %7s %7s %6s %8s %7s %8s %8s\n", "phase", "avg W", "max W", "busy%", "GPU MHz", "Tj max", "fan max", "CPU MHz"
+      for (i=1; i<=k; i++) { p=order[i]
+        printf "  %-9s %7.0f %7d %6.0f %8.0f %7d %8d %8.0f\n", p, w[p]/n[p], mw[p], b[p]/n[p], c[p]/n[p], tj[p], fan[p], cpu[p]/n[p] } }' \
+    "$OUT/powerlog.csv"
+} >"$OUT/summary.txt"
+
+echo
+cat "$OUT/summary.txt"
+ok "report written to $OUT"

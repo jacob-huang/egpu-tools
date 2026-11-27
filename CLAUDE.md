@@ -20,6 +20,7 @@ Bash tooling to hot-plug a Thunderbolt/USB4 eGPU on Linux: `bin/egpu-on`, `bin/e
 | `etc/egpu-tools.conf` | Default config, installed to `/etc/egpu-tools.conf` only if that file doesn't exist |
 | `install.sh` | Installer and uninstaller. When piped (`curl … \| bash`), it downloads the GitHub tarball and re-runs the copy inside it |
 | `tests/run.sh` | Offline test suite. Detection is tested against a fake sysfs tree via `SYS_PCI` / `SYS_TB` |
+| `tools/egpu-bench` | Read-only benchmark with power log, run from a clone (not installed). Results go in `docs/reference-benchmarks.md` |
 
 ## Conventions
 

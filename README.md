@@ -237,8 +237,10 @@ lib/egpu-tools/      common.sh, shared detection and session helpers
 udev/                80-egpu-no-runpm.rules, 81-egpu-mutter-ignore.rules
 etc/                 egpu-tools.conf, the default config
 docs/RUNBOOK.md      operations runbook for the reference setup
+docs/reference-benchmarks.md  measured results per host, compare with tools/egpu-bench
 install.sh           installer and uninstaller
 tests/run.sh         offline tests (no eGPU, root or sudo needed)
+tools/egpu-bench     benchmark + power log (read-only, run from a clone)
 LICENSE              MIT
 ```
 

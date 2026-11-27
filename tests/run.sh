@@ -30,7 +30,7 @@ expect_rc() {  # expect_rc NAME RC CMD...
   if [[ $rc -eq $want ]]; then t_ok "$name"; else t_fail "$name (rc $rc, want $want)" "$out"; fi
 }
 
-SCRIPTS=(bin/egpu-on bin/egpu-off install.sh lib/egpu-tools/common.sh tests/run.sh)
+SCRIPTS=(bin/egpu-on bin/egpu-off install.sh lib/egpu-tools/common.sh tests/run.sh tools/egpu-bench)
 
 echo "Syntax"
 for f in "${SCRIPTS[@]}"; do check "bash -n $f" bash -n "$f"; done

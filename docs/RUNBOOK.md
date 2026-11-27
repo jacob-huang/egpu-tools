@@ -703,6 +703,8 @@ DRI_PRIME=1 glmark2 --off-screen -s 1920x1080
 
 These benchmarks are light, and most scenes hit the CPU and link limit of about 30k fps, so they confirm the card works rather than measure its full speed. The `vertex device-local=false` scene (about 6.2k fps) is a good indicator of USB4 link health; a big drop there points to a cable or link problem.
 
+Re-checks, the full-load stress test at 8K (the card holds its 339 W limit), host hardware specs and per-host comparisons are in [reference-benchmarks.md](reference-benchmarks.md). Run `tools/egpu-bench` to measure a host the same way.
+
 ---
 
 ## 9. Change log
@@ -735,3 +737,4 @@ These benchmarks are light, and most scenes hit the CPU and link limit of about 
 | 2026-11-26 | `egpu-off`: when the eGPU is untagged but rule 81 is already installed (eGPU connected before the install), it now says to reconnect while logged out instead of to install the rule. Its post-detach kernel-log check only reports messages about the eGPU's PCI slot or Thunderbolt. `egpu-on`: removing the other functions (HDMI audio) during a T5 re-initialize now times out like the GPU removal (exit `3`). |
 | 2026-11-26 | `egpu-on` / `egpu-off`: the driver lookup no longer reports `driver` for a GPU with no driver bound (`readlink -f` succeeded on the missing link), so health checks and status lines now see an unbound card as unbound. T4: added the failed-init case (`ring gfx test failed (-110)`, `device lost from bus!`) seen on a second host after booting with the enclosure on, fixed by reseating the GPU power connectors and draining the PSU; §3 notes that booting with the eGPU attached failed there. |
 | 2026-11-26 | README reorganized: purpose, install, a step-by-step user guide (connect, use, disconnect, start-up and shut-down order, command reference with every option and exit code), then common issues and troubleshooting linked to T1–T9. |
+| 2026-11-26 | Benchmarks: added `tools/egpu-bench` (read-only benchmark with power log) and `docs/reference-benchmarks.md` (hardware specs, 1080p re-checks, 8K full-load run: the card holds its 339 W limit at a 96 °C hotspot peak, and the enclosure PSU sustains it). §8 links to it. |
