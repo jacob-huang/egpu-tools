@@ -572,12 +572,13 @@ grep -H . /sys/class/power_supply/*/{type,scope,online}    # what the kernel cou
 **Fix:** stop `ucsi_acpi` from registering the ports, then re-probe the eGPU (amdgpu only reads the power source when the card starts):
 
 ```bash
-echo "blacklist ucsi_acpi" | sudo tee /etc/modprobe.d/egpu-no-ucsi.conf   # permanent, from the next boot
+echo "blacklist ucsi_acpi" | sudo tee /etc/modprobe.d/egpu-no-ucsi.conf   # permanent ...
+sudo update-initramfs -u                                                  # ... including early boot (required)
 sudo modprobe -r ucsi_acpi                                                # now, without rebooting
 egpu-off && egpu-on                                                       # the power limit should now read ~339 W
 ```
 
-Trade-off: `/sys/class/typec` (USB-C role and alt-mode status) disappears. USB-C ports and the USB4 eGPU port keep working, because the firmware manages them. Check that `ucsi_acpi` isn't in your initramfs (`lsinitramfs /boot/initrd.img-$(uname -r) | grep ucsi`); if it is, run `sudo update-initramfs -u` too. To undo, delete the file and reboot.
+Trade-off: `/sys/class/typec` (USB-C role and alt-mode status) disappears. USB-C ports and the USB4 eGPU port keep working, because the firmware manages them. **Don't skip `update-initramfs`.** Ubuntu's initramfs includes `ucsi_acpi`, which then loads early in boot with the initramfs's own copy of `/etc/modprobe.d`. Without the rebuild, the blacklist is ignored and the 0 W limit returns after a reboot (seen 2026-11-26). Checking with `lsinitramfs` needs `sudo`: the initramfs is readable only by root, and without sudo the check prints nothing, which looks like a clean result. After the next boot, `lsmod | grep ucsi_acpi` should print nothing. To undo, delete the file, run `sudo update-initramfs -u` and reboot.
 
 Ruled out on that host: the enclosure's PSU (the same card holds 339 W on the reference host) and the PCIe `ACSViol` errors on its Thunderbolt root port (booting with `pci=noaer` removed the error reports, but the 0 W limit remained).
 
@@ -768,3 +769,4 @@ Re-checks, the full-load stress test at 8K (the card holds its 339 W limit), hos
 | 2026-11-26 | README reorganized: purpose, install, a step-by-step user guide (connect, use, disconnect, start-up and shut-down order, command reference with every option and exit code), then common issues and troubleshooting linked to T1–T9. |
 | 2026-11-26 | Benchmarks: added `tools/egpu-bench` (read-only benchmark with power log) and `docs/reference-benchmarks.md` (hardware specs, 1080p re-checks, 8K full-load run: the card holds its 339 W limit at a 96 °C hotspot peak, and the enclosure PSU sustains it). §8 links to it. |
 | 2026-11-26 | Version 1.1.0. New T10: a 0 W power limit keeps the eGPU at its lowest clocks when the kernel thinks the PC runs on battery. Seen on a Dell Pro Micro Plus, whose USB-C ports (`ucsi_acpi`) register as offline power supplies; fixed by blacklisting `ucsi_acpi`. `egpu-on` shows the power limit and warns at 0 W (exit codes unchanged); `egpu-bench` reports `on mains` and no longer exits 1 on success. T4: the enclosure PSU was ruled out. `reference-benchmarks.md`: Host B specs and results, including a Balanced vs Performance comparison. |
+| 2026-11-26 | T10: the `ucsi_acpi` blacklist needs an initramfs rebuild (`update-initramfs -u`). Without it, the module loads from the initramfs and the 0 W limit returns after a reboot. The old check (`lsinitramfs` without root) printed nothing and looked clean. |
