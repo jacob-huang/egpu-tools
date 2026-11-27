@@ -92,7 +92,20 @@ What it shows:
 - **The card reaches its full power on Host B too**: 337 W in the 8K vkmark phase, close to Host A's score.
 - **CPU-bound scenes are faster than on Host A.** 1080p and 4K glmark2 beat Host A by 30% and 13%, because Host B has the faster CPU.
 - **Moving data over USB4 is slower than on Host A.** `device-local=false`, which streams vertex data over the link every frame, is about 20% lower. 8K refract runs at about 40% of Host A's rate (Host A about 1,430 fps, derived from its score), with the GPU waiting at about 117 W and 1,260 MHz.
-- **The power profile doesn't explain that gap.** A 31% faster CPU changed results by 7% at most and didn't speed up refract. The likely cause is the host's Intel USB4 path moving data more slowly than Host A's AMD one at the same 40 Gb/s link rate. That's not confirmed. Work that stays in VRAM, like 8K vkmark, isn't affected.
+- **The power profile doesn't explain that gap.** A 31% faster CPU changed results by 7% at most and didn't speed up refract. Work that stays in VRAM, like 8K vkmark, isn't affected.
+
+#### Host B transfer gap: what was checked (2026-11-27)
+
+| Possible cause | Host B (Intel) | Host A (AMD) | Verdict |
+|---|---|---|---|
+| CPU power profile | Balanced vs Performance: at most 7% change | — | Not the cause |
+| SWIOTLB bounce buffering (untrusted Thunderbolt device) | 64 MB pool, **never used** while streaming (0 of 115 samples) | Same 64 MB pool | Not the cause |
+| IOMMU mode | Strict (`DMA`): Thunderbolt DMA protection, bolt `iommu+user` | Same DMA protection and policy | Same on both |
+| PCIe max payload | 128 bytes: the root port's limit, so every hop uses 128 | Root port also limited to 128 bytes | Same on both |
+| PCIe ASPM | Off on every hop inside the enclosure | Not checked | Unlikely |
+| USB4 link power states (CLx) | Enabled in the driver (`thunderbolt.clx=Y`) | Enabled in the driver | Untested (would need `thunderbolt.clx=0` at boot) |
+
+**Conclusion:** every setting that could be compared matches on both hosts. The remaining gap most likely comes from how the two USB4 host controllers tunnel PCIe traffic (Intel's integrated Thunderbolt 4 vs AMD's USB4), which software can't change. It only shows up in work that streams data between system RAM and the GPU every frame. Reducing that traffic (keep models and assets in VRAM) helps more on Host B than on Host A.
 
 ## Comparing a host
 
