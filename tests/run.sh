@@ -119,6 +119,11 @@ rm "$F/pci/0000:08:00.0/removable"
 [[ -z "$(det egpu_gpu_addr)" ]] && t_ok "no removable GPU -> nothing detected" || t_fail "no removable GPU" "$(det egpu_gpu_addr)"
 [[ "$(det 'egpu_rpm 0000:08:00.0')" == active ]] && t_ok "egpu_rpm" || t_fail "egpu_rpm"
 [[ "$(det 'egpu_rpm 0000:99:00.0')" == '?' ]] && t_ok "egpu_rpm on missing device" || t_fail "egpu_rpm on missing device"
+[[ -z "$(det 'egpu_driver 0000:08:00.0')" ]] && t_ok "egpu_driver on an unbound device prints nothing" \
+  || t_fail "egpu_driver on an unbound device" "$(det 'egpu_driver 0000:08:00.0')"
+mkdir -p "$F/drivers/amdgpu"; ln -s ../../drivers/amdgpu "$F/pci/0000:08:00.0/driver"
+[[ "$(det 'egpu_driver 0000:08:00.0')" == amdgpu ]] && t_ok "egpu_driver on a bound device" \
+  || t_fail "egpu_driver on a bound device" "$(det 'egpu_driver 0000:08:00.0')"
 [[ "$(det 'egpu_offload_hint nvidia 10de:2684')" == __NV_PRIME* ]] && t_ok "NVIDIA offload hint" || t_fail "NVIDIA offload hint"
 
 echo "udev rules"
