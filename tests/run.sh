@@ -125,6 +125,26 @@ mkdir -p "$F/drivers/amdgpu"; ln -s ../../drivers/amdgpu "$F/pci/0000:08:00.0/dr
 [[ "$(det 'egpu_driver 0000:08:00.0')" == amdgpu ]] && t_ok "egpu_driver on a bound device" \
   || t_fail "egpu_driver on a bound device" "$(det 'egpu_driver 0000:08:00.0')"
 [[ "$(det 'egpu_offload_hint nvidia 10de:2684')" == __NV_PRIME* ]] && t_ok "NVIDIA offload hint" || t_fail "NVIDIA offload hint"
+[[ -z "$(det 'egpu_power_cap 0000:08:00.0')" ]] && t_ok "egpu_power_cap without hwmon prints nothing" || t_fail "egpu_power_cap without hwmon"
+mkdir -p "$F/pci/0000:08:00.0/hwmon/hwmon3"; echo 339000000 > "$F/pci/0000:08:00.0/hwmon/hwmon3/power1_cap"
+[[ "$(det 'egpu_power_cap 0000:08:00.0')" == 339 ]] && t_ok "egpu_power_cap in watts" || t_fail "egpu_power_cap in watts" "$(det 'egpu_power_cap 0000:08:00.0')"
+
+# Mains detection mirrors power_supply_is_system_supplied().
+mkpsu() {  # mkpsu NAME TYPE SCOPE ONLINE
+  local d=$F/psu/$1; mkdir -p "$d"; echo "$2" > "$d/type"; echo "$3" > "$d/scope"; echo "$4" > "$d/online"
+}
+psu() { bash -c ". lib/egpu-tools/common.sh; SYS_PSU=$F/psu; $1"; }
+mkdir -p "$F/psu"
+psu egpu_on_mains && t_ok "no power supplies -> desktop on mains" || t_fail "no power supplies -> mains"
+mkpsu hidpp_battery_0 Battery Device 1
+psu egpu_on_mains && t_ok "device battery (mouse) is ignored" || t_fail "device battery is ignored"
+mkpsu ucsi-source-psy-USBC000:001 USB System 0
+mkpsu ucsi-source-psy-USBC000:002 USB System 0
+! psu egpu_on_mains && t_ok "only offline USB-C supplies -> not on mains" || t_fail "offline USB-C supplies -> not on mains"
+[[ "$(psu egpu_offline_supplies)" == "ucsi-source-psy-USBC000:001 ucsi-source-psy-USBC000:002" ]] \
+  && t_ok "egpu_offline_supplies lists them" || t_fail "egpu_offline_supplies" "$(psu egpu_offline_supplies)"
+mkpsu AC Mains System 1
+psu egpu_on_mains && t_ok "an online mains supply -> on mains" || t_fail "online mains supply -> mains"
 
 echo "udev rules"
 for r in udev/*.rules; do

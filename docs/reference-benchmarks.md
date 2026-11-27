@@ -21,14 +21,15 @@ tools/egpu-bench            # about 12 minutes; --quick runs the 1080p part only
 
 | | Host A (reference) | Host B |
 |---|---|---|
-| Machine | Beelink SER-series mini PC (DMI `AZW SER`) | *pending* |
-| CPU | AMD Ryzen 7 255, 8 cores / 16 threads, up to 4.97 GHz | |
-| iGPU | Radeon 780M | |
-| Memory | 28.6 GiB visible to the OS | |
-| USB4 host | AMD USB4/Thunderbolt PCIe tunnel (root port `00:03.1`) | |
-| USB4 link | 40 Gb/s (2 lanes × 20 Gb/s) | |
-| OS | Ubuntu 26.04.1 LTS, kernel 7.0.0-44, GNOME 50.1 Wayland | |
-| Mesa | 26.0.8 (RADV / radeonsi) | |
+| Machine | Beelink SER-series mini PC (DMI `AZW SER`) | Dell Pro Micro Plus mini PC (BIOS 1.19.3) |
+| CPU | AMD Ryzen 7 255, 8 cores / 16 threads, up to 4.97 GHz | Intel Core Ultra 7 265, 20 cores / 20 threads, up to 5.3 GHz |
+| iGPU | Radeon 780M | Intel Graphics (Arrow Lake-S) |
+| Memory | 28.6 GiB visible to the OS | 61 GiB visible to the OS |
+| USB4 host | AMD USB4/Thunderbolt PCIe tunnel (root port `00:03.1`) | Intel Thunderbolt 4 PCIe root port (`00:07.0`) |
+| USB4 link | 40 Gb/s (2 lanes × 20 Gb/s) | 40 Gb/s (2 lanes × 20 Gb/s) |
+| OS | Ubuntu 26.04.1 LTS, kernel 7.0.0-44, GNOME 50.1 Wayland | Same |
+| Mesa | 26.0.8 (RADV / radeonsi) | 26.0.8 |
+| Quirk | — | USB-C ports register as offline power supplies (`ucsi_acpi`), so the eGPU got a 0 W limit until `ucsi_acpi` was blacklisted ([T10](RUNBOOK.md#t10-power-limit-reads-0-w-and-the-clocks-stay-at-the-lowest-step)) |
 
 ## Results
 
@@ -36,13 +37,13 @@ tools/egpu-bench            # about 12 minutes; --quick runs the 1080p part only
 
 Light scenes. Most hit the CPU and link limit of about 30k fps, so this run confirms the card and link work rather than measuring the GPU's speed. `vertex device-local=false` streams vertex data over the link every frame; a big drop there points to a cable or link problem.
 
-| Benchmark | Host A 2026-11-10 | Host A 2026-11-11 | Host A 2026-11-26 | Host B |
+| Benchmark | Host A 2026-11-10 | Host A 2026-11-11 | Host A 2026-11-26 | Host B 2026-11-26 |
 |---|---|---|---|---|
-| `vkmark --winsys headless -s 1920x1080` | 27,302 | 27,666 | 27,877 | |
-| `glmark2 --off-screen -s 1920x1080` | 10,168 | 9,912 | 9,963 | |
-| vkmark `vertex device-local=false` | about 6.2k fps | 6,182 fps | 6,218 fps | |
-| GPU power, vkmark (avg / peak) | — | — | 158 W / 284 W, 95% busy | |
-| GPU power, glmark2 (avg / peak) | — | — | 39 W / 79 W, 49% busy | |
+| `vkmark --winsys headless -s 1920x1080` | 27,302 | 27,666 | 27,877 | 28,290 |
+| `glmark2 --off-screen -s 1920x1080` | 10,168 | 9,912 | 9,963 | 13,764 |
+| vkmark `vertex device-local=false` | about 6.2k fps | 6,182 fps | 6,218 fps | 5,013 fps |
+| GPU power, vkmark (avg / peak) | — | — | 158 W / 284 W, 95% busy | 161 W / 280 W, 97% busy |
+| GPU power, glmark2 (avg / peak) | — | — | 39 W / 79 W, 49% busy | 41 W / 65 W, 55% busy |
 
 Host A's 780M iGPU scored 15,685 in vkmark for comparison. A ±2% difference between runs is normal variation. The 2026-11-26 power figures come from a `tools/egpu-bench --quick` run (vkmark 27,664, glmark2 10,191, `device-local=false` 6,179 fps). glmark2 at 1080p barely loads the card: it averages under 40 W at about 1,250 MHz, so **power below 70–100 W in glmark2 is normal**.
 
@@ -63,11 +64,41 @@ What it shows:
 - **The enclosure's PSU sustains full draw:** about 2½ minutes with no bus drop or driver errors (compare runbook T4).
 - **glmark2 at 1080p and 4K keeps the card under 150 W** (under 40 W on average at 1080p) because it waits on the CPU and the link between frames. vkmark at 1080p loads it harder (158 W on average, 284 W peak). Low power in glmark2 is expected, not a fault. Real games and LLM inference fall between the two cases: the more of the work stays in VRAM, the closer the card gets to 339 W.
 
+### Host B (2026-11-26)
+
+Full `tools/egpu-bench` runs after the [T10](RUNBOOK.md#t10-power-limit-reads-0-w-and-the-clocks-stay-at-the-lowest-step) fix. The results tables above use the Performance power profile. Before the fix, with the card held at a 0 W limit, the quick run scored vkmark 8,298, glmark2 2,783 and `device-local=false` 4,054 fps, at 23 W and 520 MHz with the GPU 98% busy.
+
+| Phase | Result | Avg power | Load | GPU clock | Hotspot max | Fan max |
+|---|---|---|---|---|---|---|
+| Idle | — | about 6 W | 0% | idle | 44 °C | 0 rpm |
+| 4K glmark2: terrain, refract, jellyfish, phong | score 5,316 (terrain 612 fps) | 88 W | 62% | about 1,270 MHz | 77 °C | about 1,170 rpm |
+| 8K glmark2: terrain, refract | score 441 (terrain 313 fps, refract 571 fps) | 188 W (terrain up to 347 W, refract about 117 W) | 76% | 1,743 MHz | 85 °C | about 1,260 rpm |
+| 8K vkmark: blur, phong, texture | score 11,382 | **337 W** | 99% | 2,702 MHz | 96 °C | about 1,940 rpm |
+
+Power profile, Balanced vs Performance (the same host, minutes apart). Performance only raises the CPU's energy preference: the firmware's platform profile stays `balanced`, its highest option on this machine.
+
+| | Balanced | Performance | Change |
+|---|---|---|---|
+| Average CPU clock, 8K glmark2 | 1,958 MHz | 2,560 MHz | +31% |
+| 1080p vkmark | 28,762 | 28,290 | −2% (noise) |
+| vkmark `device-local=false` | 4,681 fps | 5,013 fps | +7% |
+| 1080p glmark2 | 13,162 | 13,764 | +5% |
+| 4K glmark2 | 5,004 | 5,316 | +6% |
+| 8K glmark2 (refract) | 469 (608 fps) | 441 (571 fps) | −6% |
+| 8K vkmark | 10,835 | 11,382 | +5% |
+
+What it shows:
+
+- **The card reaches its full power on Host B too**: 337 W in the 8K vkmark phase, close to Host A's score.
+- **CPU-bound scenes are faster than on Host A.** 1080p and 4K glmark2 beat Host A by 30% and 13%, because Host B has the faster CPU.
+- **Moving data over USB4 is slower than on Host A.** `device-local=false`, which streams vertex data over the link every frame, is about 20% lower. 8K refract runs at about 40% of Host A's rate (Host A about 1,430 fps, derived from its score), with the GPU waiting at about 117 W and 1,260 MHz.
+- **The power profile doesn't explain that gap.** A 31% faster CPU changed results by 7% at most and didn't speed up refract. The likely cause is the host's Intel USB4 path moving data more slowly than Host A's AMD one at the same 40 Gb/s link rate. That's not confirmed. Work that stays in VRAM, like 8K vkmark, isn't affected.
+
 ## Comparing a host
 
 If a host draws much less power than Host A in the **8K** phases, look at `summary.txt` and `specs.txt` in this order:
 
-1. **Power limit:** `power limit` should say 339 W. A lower cap limits power directly.
+1. **Power limit:** `power limit` should say 339 W. A lower cap limits power directly. **0 W** means amdgpu applied the card's battery (DC) limit: check that `on mains` says `yes`. Host B read 0 W until its USB-C ports stopped registering as offline power supplies (runbook [T10](RUNBOOK.md#t10-power-limit-reads-0-w-and-the-clocks-stay-at-the-lowest-step)).
 2. **USB4 link:** `tb link` should be 40 Gb/s x2. A 20 Gb/s link, a Thunderbolt 3 host or a single lane means a cable or port problem.
 3. **PCIe chain:** the host root port and the enclosure's first bridge sit inside the USB4 tunnel and show a nominal 2.5 GT/s, which is normal. After them, Host A shows 16 GT/s x4 up to the GPU's switch and 16 GT/s x16 at the GPU.
 4. **CPU:** compare the `CPU MHz` column and `cpu governor` / `platform profile`. A slower or power-saving CPU can't feed the GPU at 1080p or 4K, but at 8K the GPU should still be the bottleneck.
