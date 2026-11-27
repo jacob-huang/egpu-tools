@@ -57,6 +57,7 @@ LIB=${SELF%/*}/../lib/egpu-tools/common.sh
 # Processes (by /proc/PID/comm, max 15 chars) that tolerate GPU hot-unplug.
 # systemd / systemd-logind hold DRM fds for session device management.
 ALLOW_COMM=(systemd systemd-logind gnome-shell gnome-shell-cal Xwayland mutter-x11-fram)
+IGNORE_RULE=/etc/udev/rules.d/81-egpu-mutter-ignore.rules
 
 DRY_RUN=0 FORCE=0 YES=0 ALLOW_GUI=0
 for arg in "$@"; do
@@ -110,8 +111,13 @@ elif (( ${#GUI_ACTIVE[@]} )); then
     warn "while logged out (or log out and back in) so GNOME skips it."
   else
     warn "GNOME manages the eGPU's display device (${CARD_NODE##*/}${MUTTER_PIDS:+, gnome-shell pid $MUTTER_PIDS})."
-    warn "To detach without logging out in future, install the 81-egpu-mutter-ignore rule"
-    warn "(install.sh does this) and reconnect the eGPU once while logged out."
+    if [[ -f "$IGNORE_RULE" ]]; then
+      warn "$IGNORE_RULE is installed, but the eGPU was connected before it took effect."
+      warn "To detach without logging out in future, reconnect the eGPU once while logged out."
+    else
+      warn "To detach without logging out in future, install the 81-egpu-mutter-ignore rule"
+      warn "(install.sh does this) and reconnect the eGPU once while logged out."
+    fi
   fi
   warn "Known risk: GNOME/mutter crashes minutes after an eGPU hot-remove, at the next"
   warn "monitor change (\"meta_kms_update_mode_set: assertion failed\"), ending the session"
@@ -219,7 +225,11 @@ fi
 
 if (( GUI_BLOCKED )); then
   err "Not safe to detach while GNOME manages the eGPU in an active session. Log out first,"
-  err "install the mutter-device-ignore rule for next time, or re-run with"
+  if [[ -f "$IGNORE_RULE" ]]; then
+    err "reconnect the eGPU once while logged out so the mutter-device-ignore rule applies, or re-run with"
+  else
+    err "install the mutter-device-ignore rule for next time, or re-run with"
+  fi
   err "--allow-graphical-session to accept the crash risk (--force does not override this)."
   exit 2
 fi
@@ -277,8 +287,9 @@ if [[ -e "$SYS_PCI/$GPU" ]]; then
   exit 3
 fi
 
+# Only messages about the eGPU's PCI slot (GPU and audio functions) or Thunderbolt.
 errs=$(journalctl -k --no-pager -q --since "$START_TS" 2>/dev/null \
-        | grep -iE 'error|fail|hung|timeout' \
+        | grep -iE "$SLOT|thunderbolt" | grep -iE 'error|fail|hung|timeout' \
         | grep -vE 'UNLOAD_TA|psp ring|BAR' || true)
 if [[ -n "$errs" ]]; then
   warn "Unexpected kernel messages during removal (review before powering off):"
